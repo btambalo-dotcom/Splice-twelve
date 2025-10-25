@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime
 import os, re
 
+# -------- Config --------
 ALLOWED_EXTENSIONS = {"xlsx", "xls", "csv"}
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
@@ -19,6 +20,7 @@ db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
+# -------- Models --------
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(64), unique=True, nullable=False)
@@ -35,7 +37,7 @@ class DeviceType(db.Model):
 class SpliceTier(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     min_splices = db.Column(db.Integer, nullable=False)
-    max_splices = db.Column(db.Integer, nullable=True)
+    max_splices = db.Column(db.Integer, nullable=True)  # None = ∞
     price_per_splice = db.Column(db.Float, nullable=False, default=0.0)
 
 class Record(db.Model):
@@ -54,6 +56,7 @@ class Record(db.Model):
 @login_manager.user_loader
 def load_user(user_id): return User.query.get(int(user_id))
 
+# -------- Helpers --------
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -78,6 +81,7 @@ def match_target(col: str):
     return None
 
 def parse_dataframe(df: pd.DataFrame, sheet_name: str):
+    # rename by header
     renamed = {}
     for col in df.columns:
         target = match_target(col)
@@ -85,20 +89,21 @@ def parse_dataframe(df: pd.DataFrame, sheet_name: str):
             renamed[col] = target
     work = df.rename(columns=renamed).copy()
 
-    def ensure_field(field, candidates):
+    # best-effort ensure
+    def ensure(field, cands):
         nonlocal work
         if field not in work.columns:
             for cand in work.columns:
                 cn = normalize_col(cand)
-                for pat in candidates:
+                for pat in cands:
                     if re.search(pat, cn):
                         work = work.rename(columns={cand: field})
                         return
-    ensure_field("type", [r"type", r"tipo", r"category"])
-    ensure_field("map", [r"map", r"mapa"])
-    ensure_field("splices", [r"splice", r"fus"])
-    ensure_field("device", [r"device", r"dispositivo", r"aparelho", r"equip"])
-    ensure_field("created_date", [r"created", r"data", r"date"])
+    ensure("type", [r"type", r"tipo", r"category"])
+    ensure("map", [r"map", r"mapa"])
+    ensure("splices", [r"splice", r"fus"])
+    ensure("device", [r"device", r"dispositivo", r"aparelho", r"equip"])
+    ensure("created_date", [r"created", r"data", r"date"])
 
     keep = [c for c in ["type","map","splices","device","created_date"] if c in work.columns]
     sub = work[keep].copy()
@@ -109,6 +114,7 @@ def parse_dataframe(df: pd.DataFrame, sheet_name: str):
         sub["splices"] = pd.to_numeric(sub["splices"], errors="coerce").fillna(0).astype(int)
     return sub
 
+# ---- SMART EXCEL READER (fix for 2-row headers) ----
 def combine_multiindex_columns(df):
     try:
         if isinstance(df.columns, pd.MultiIndex):
@@ -135,48 +141,39 @@ def guess_fields_by_content(df):
     for c in df.columns:
         try:
             series = df[c].astype(str).str.strip().str.lower()
-            ratio = (series.isin(type_like)).mean()
-            if ratio > 0.3:
-                candidates["type"] = c
-                break
+            if (series.isin(type_like)).mean() > 0.3:
+                candidates["type"] = c; break
         except Exception:
             continue
-
-    best_num = None; best_score = -1
+    # splices numeric
+    best_num, best_score = None, -1
     for c in df.columns:
         try:
             nums = pd.to_numeric(df[c], errors="coerce")
-            notnull = nums.notna().mean()
-            if notnull < 0.5: continue
+            if nums.notna().mean() < 0.5: continue
             ints = (nums.dropna() % 1 == 0).mean()
             median = nums.dropna().median() if not nums.dropna().empty else 0
             score = ints + (1.0 if median <= 200 else 0.0)
-            if score > best_score:
-                best_score = score; best_num = c
+            if score > best_score: best_score, best_num = score, c
         except Exception: continue
-    if best_num:
-        candidates["splices"] = best_num
-
+    if best_num: candidates["splices"] = best_num
+    # device alfanumérico
     device_pattern = re.compile(r"^[A-Za-z0-9\-_/]{4,}$")
-    best_dev = None; best_dev_score = -1
+    best_dev, best_dev_score = None, -1
     for c in df.columns:
         try:
             s = df[c].astype(str).str.strip()
-            m = s.apply(lambda x: bool(device_pattern.match(x)) and not x.isdigit())
-            score = m.mean()
-            if score > best_dev_score:
-                best_dev_score = score; best_dev = c
+            score = s.apply(lambda x: bool(device_pattern.match(x)) and not x.isdigit()).mean()
+            if score > best_dev_score: best_dev_score, best_dev = score, c
         except Exception: continue
-    if best_dev_score >= 0.3:
-        candidates["device"] = best_dev
-
-    best_map = None; best_map_score = -1
+    if best_dev_score >= 0.3: candidates["device"] = best_dev
+    # map: textos longos com vírgula
+    best_map, best_map_score = None, -1
     for c in df.columns:
         try:
             s = df[c].astype(str)
             score = s.str.contains(",").mean() + (s.str.len().median() / 100.0)
-            if score > best_map_score:
-                best_map_score = score; best_map = c
+            if score > best_map_score: best_map_score, best_map = score, c
         except Exception: continue
     candidates["map"] = best_map
 
@@ -186,19 +183,18 @@ def guess_fields_by_content(df):
     return df
 
 def read_excel_smart(file):
+    # try normal header
     try:
         xl = pd.ExcelFile(file)
         frames = []
         for nm in xl.sheet_names:
-            df0 = xl.parse(nm)  # header=0
+            df0 = xl.parse(nm)
             df0 = parse_dataframe(df0, nm)
             frames.append(df0)
         df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        if set(["type","map","splices","device"]).issubset(set(df.columns)):
-            return df
-    except Exception:
-        pass
-
+        if set(["type","map","splices","device"]).issubset(set(df.columns)): return df
+    except Exception: pass
+    # try multi-row header
     try:
         xl = pd.ExcelFile(file)
         frames = []
@@ -210,9 +206,8 @@ def read_excel_smart(file):
                 df1 = guess_fields_by_content(df1)
             frames.append(df1)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    except Exception:
-        pass
-
+    except Exception: pass
+    # try using row 2 as header
     try:
         xl = pd.ExcelFile(file)
         frames = []
@@ -223,9 +218,8 @@ def read_excel_smart(file):
                 df2 = guess_fields_by_content(df2)
             frames.append(df2)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    except Exception:
-        pass
-
+    except Exception: pass
+    # last resort: guess only
     try:
         xl = pd.ExcelFile(file)
         frames = []
@@ -238,6 +232,46 @@ def read_excel_smart(file):
     except Exception as e:
         raise e
 
+def price_for_splices(n: int):
+    tier = SpliceTier.query.filter(
+        (SpliceTier.min_splices <= n) &
+        ((SpliceTier.max_splices >= n) | (SpliceTier.max_splices.is_(None)))
+    ).order_by(SpliceTier.min_splices.desc()).first()
+    return (n * tier.price_per_splice) if tier else 0.0
+
+def price_for_device_type(type_name: str):
+    if not type_name: return 0.0
+    dt = DeviceType.query.filter(DeviceType.name.ilike(str(type_name))).first()
+    return dt.value if dt else 0.0
+
+def dataframe_with_prices(df: pd.DataFrame):
+    for col in ["type","splices"]:
+        if col not in df.columns: df[col] = None if col=="type" else 0
+    df["price_splices"] = df["splices"].apply(lambda n: price_for_splices(int(n) if pd.notna(n) else 0))
+    df["price_device"] = df["type"].apply(lambda t: price_for_device_type(str(t)) if pd.notna(t) else 0.0)
+    df["total"] = df["price_splices"] + df["price_device"]
+    return df
+
+def persist_records(df: pd.DataFrame):
+    rows = []
+    for _, r in df.iterrows():
+        rec = Record(
+            sheet=str(r.get("__sheet__", "")),
+            type=str(r.get("type", "")) if pd.notna(r.get("type", "")) else None,
+            map=str(r.get("map", "")) if pd.notna(r.get("map", "")) else None,
+            splices=int(r.get("splices", 0)) if pd.notna(r.get("splices", 0)) else 0,
+            device=str(r.get("device","")) if pd.notna(r.get("device","")) else None,
+            created_date=r.get("created_date") if isinstance(r.get("created_date"), pd.Timestamp) else None,
+            price_splices=float(r.get("price_splices", 0.0) or 0.0),
+            price_device=float(r.get("price_device", 0.0) or 0.0),
+            total=float(r.get("total", 0.0) or 0.0)
+        )
+        rows.append(rec)
+    if rows:
+        db.session.bulk_save_objects(rows)
+        db.session.commit()
+
+# -------- Routes --------
 @app.route("/init-admin")
 def init_admin():
     username = os.environ.get("ADMIN_USERNAME", "admin")
@@ -282,7 +316,6 @@ def index():
         if not allowed_file(file.filename):
             flash("Formato não suportado. Use .xlsx, .xls ou .csv", "error")
             return redirect(request.url)
-
         try:
             ext = file.filename.rsplit(".",1)[1].lower()
             if ext == "csv":
@@ -396,6 +429,7 @@ def delete_splice_tier(tid):
     flash("Faixa de fusões removida.", "success")
     return redirect(url_for("settings_home"))
 
+# ----- Reports -----
 @app.route("/reports", methods=["GET"])
 @login_required
 def reports():
