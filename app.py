@@ -65,10 +65,10 @@ HEADER_MAP = {
     "created_date": [r"^created(_| )?at$", r"^data\s*de\s*cria[çc][aã]o$", r"^data$", r"^date$", r"^created$"]
 }
 
-import re
 def normalize_col(col: str):
     if col is None: return ""
     return re.sub(r"\s+", " ", str(col).strip()).lower()
+
 def match_target(col: str):
     c = normalize_col(col)
     for target, patterns in HEADER_MAP.items():
@@ -77,7 +77,6 @@ def match_target(col: str):
                 return target
     return None
 
-import pandas as pd
 def parse_dataframe(df: pd.DataFrame, sheet_name: str):
     renamed = {}
     for col in df.columns:
@@ -110,44 +109,134 @@ def parse_dataframe(df: pd.DataFrame, sheet_name: str):
         sub["splices"] = pd.to_numeric(sub["splices"], errors="coerce").fillna(0).astype(int)
     return sub
 
-def price_for_splices(n: int):
-    tier = SpliceTier.query.filter(
-        (SpliceTier.min_splices <= n) &
-        ((SpliceTier.max_splices >= n) | (SpliceTier.max_splices.is_(None)))
-    ).order_by(SpliceTier.min_splices.desc()).first()
-    return (n * tier.price_per_splice) if tier else 0.0
-
-def price_for_device_type(type_name: str):
-    if not type_name: return 0.0
-    dt = DeviceType.query.filter(DeviceType.name.ilike(str(type_name))).first()
-    return dt.value if dt else 0.0
-
-def dataframe_with_prices(df: pd.DataFrame):
-    for col in ["type","splices"]:
-        if col not in df.columns: df[col] = None if col=="type" else 0
-    df["price_splices"] = df["splices"].apply(lambda n: price_for_splices(int(n) if pd.notna(n) else 0))
-    df["price_device"] = df["type"].apply(lambda t: price_for_device_type(str(t)) if pd.notna(t) else 0.0)
-    df["total"] = df["price_splices"] + df["price_device"]
+def combine_multiindex_columns(df):
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            new_cols = []
+            for tup in df.columns:
+                parts = [str(x) for x in tup if x is not None and str(x).strip() != "" and not str(x).startswith("Unnamed")]
+                if not parts:
+                    new_cols.append("")
+                else:
+                    cand = parts[-1].strip()
+                    if len(parts) > 1 and not re.search(r"^unnamed", parts[0], re.I):
+                        name = " ".join(parts).strip()
+                    else:
+                        name = cand
+                    new_cols.append(name)
+            df.columns = new_cols
+    except Exception:
+        pass
     return df
 
-def persist_records(df: pd.DataFrame):
-    rows = []
-    for _, r in df.iterrows():
-        rec = Record(
-            sheet=str(r.get("__sheet__", "")),
-            type=str(r.get("type", "")) if pd.notna(r.get("type", "")) else None,
-            map=str(r.get("map", "")) if pd.notna(r.get("map", "")) else None,
-            splices=int(r.get("splices", 0)) if pd.notna(r.get("splices", 0)) else 0,
-            device=str(r.get("device","")) if pd.notna(r.get("device","")) else None,
-            created_date=r.get("created_date") if isinstance(r.get("created_date"), pd.Timestamp) else None,
-            price_splices=float(r.get("price_splices", 0.0) or 0.0),
-            price_device=float(r.get("price_device", 0.0) or 0.0),
-            total=float(r.get("total", 0.0) or 0.0)
-        )
-        rows.append(rec)
-    if rows:
-        db.session.bulk_save_objects(rows)
-        db.session.commit()
+def guess_fields_by_content(df):
+    candidates = {"type": None, "map": None, "splices": None, "device": None}
+    type_like = set(["splice","test","placement","service","splicing"])
+    for c in df.columns:
+        try:
+            series = df[c].astype(str).str.strip().str.lower()
+            ratio = (series.isin(type_like)).mean()
+            if ratio > 0.3:
+                candidates["type"] = c
+                break
+        except Exception:
+            continue
+
+    best_num = None; best_score = -1
+    for c in df.columns:
+        try:
+            nums = pd.to_numeric(df[c], errors="coerce")
+            notnull = nums.notna().mean()
+            if notnull < 0.5: continue
+            ints = (nums.dropna() % 1 == 0).mean()
+            median = nums.dropna().median() if not nums.dropna().empty else 0
+            score = ints + (1.0 if median <= 200 else 0.0)
+            if score > best_score:
+                best_score = score; best_num = c
+        except Exception: continue
+    if best_num:
+        candidates["splices"] = best_num
+
+    device_pattern = re.compile(r"^[A-Za-z0-9\-_/]{4,}$")
+    best_dev = None; best_dev_score = -1
+    for c in df.columns:
+        try:
+            s = df[c].astype(str).str.strip()
+            m = s.apply(lambda x: bool(device_pattern.match(x)) and not x.isdigit())
+            score = m.mean()
+            if score > best_dev_score:
+                best_dev_score = score; best_dev = c
+        except Exception: continue
+    if best_dev_score >= 0.3:
+        candidates["device"] = best_dev
+
+    best_map = None; best_map_score = -1
+    for c in df.columns:
+        try:
+            s = df[c].astype(str)
+            score = s.str.contains(",").mean() + (s.str.len().median() / 100.0)
+            if score > best_map_score:
+                best_map_score = score; best_map = c
+        except Exception: continue
+    candidates["map"] = best_map
+
+    for k, src in candidates.items():
+        if src and k not in df.columns:
+            df.rename(columns={src: k}, inplace=True)
+    return df
+
+def read_excel_smart(file):
+    try:
+        xl = pd.ExcelFile(file)
+        frames = []
+        for nm in xl.sheet_names:
+            df0 = xl.parse(nm)  # header=0
+            df0 = parse_dataframe(df0, nm)
+            frames.append(df0)
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if set(["type","map","splices","device"]).issubset(set(df.columns)):
+            return df
+    except Exception:
+        pass
+
+    try:
+        xl = pd.ExcelFile(file)
+        frames = []
+        for nm in xl.sheet_names:
+            df1 = xl.parse(nm, header=[0,1])
+            df1 = combine_multiindex_columns(df1)
+            df1 = parse_dataframe(df1, nm)
+            if not set(["type","map","splices","device"]).issubset(set(df1.columns)):
+                df1 = guess_fields_by_content(df1)
+            frames.append(df1)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    except Exception:
+        pass
+
+    try:
+        xl = pd.ExcelFile(file)
+        frames = []
+        for nm in xl.sheet_names:
+            df2 = xl.parse(nm, header=1)
+            df2 = parse_dataframe(df2, nm)
+            if not set(["type","map","splices","device"]).issubset(set(df2.columns)):
+                df2 = guess_fields_by_content(df2)
+            frames.append(df2)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    except Exception:
+        pass
+
+    try:
+        xl = pd.ExcelFile(file)
+        frames = []
+        for nm in xl.sheet_names:
+            df3 = xl.parse(nm)
+            df3 = guess_fields_by_content(df3)
+            df3 = parse_dataframe(df3, nm)
+            frames.append(df3)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    except Exception as e:
+        raise e
 
 @app.route("/init-admin")
 def init_admin():
@@ -193,27 +282,26 @@ def index():
         if not allowed_file(file.filename):
             flash("Formato não suportado. Use .xlsx, .xls ou .csv", "error")
             return redirect(request.url)
+
         try:
             ext = file.filename.rsplit(".",1)[1].lower()
-            frames = []
             if ext == "csv":
                 df = pd.read_csv(file)
-                frames.append(parse_dataframe(df, "CSV"))
+                raw = parse_dataframe(df, "CSV")
             else:
-                xl = pd.ExcelFile(file)
-                for name in xl.sheet_names:
-                    df = xl.parse(name)
-                    frames.append(parse_dataframe(df, name))
-            raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                raw = read_excel_smart(file)
         except Exception as e:
             flash(f"Erro ao ler o arquivo: {e}", "error")
             return redirect(request.url)
+
         priced = dataframe_with_prices(raw.copy())
         persist_records(priced)
+
         disp = priced.copy()
         if "created_date" in disp.columns:
             disp["created_date"] = pd.to_datetime(disp["created_date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         table_html = disp.to_html(index=False, classes="table table-striped table-sm")
+
         os.makedirs("tmp", exist_ok=True)
         fname = f"resultado_{datetime.now().strftime('%Y%m%d%H%M%S%f')}.csv"
         path = os.path.join("tmp", fname)
@@ -414,7 +502,6 @@ def reports_export():
     csv_bytes = sio.getvalue().encode("utf-8-sig")
     return Response(csv_bytes, mimetype="text/csv",
                     headers={"Content-Disposition":"attachment; filename=records_export.csv"})
-
 
 @app.cli.command("init-db")
 def init_db():
