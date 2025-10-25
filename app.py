@@ -1,13 +1,12 @@
-from flask import Flask, render_template, request, redirect, url_for, send_file, flash, session
+from flask import Flask, render_template, request, redirect, url_for, send_file, flash, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user, UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import pandas as pd
 from datetime import datetime
-import os, re, io
+import os, re
 
-# --- Config ---
 ALLOWED_EXTENSIONS = {"xlsx", "xls", "csv"}
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
@@ -20,25 +19,23 @@ db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
-# --- Models ---
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(255), unique=True, nullable=False)
+    username = db.Column(db.String(64), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     is_admin = db.Column(db.Boolean, default=True)
-
     def set_password(self, password): self.password_hash = generate_password_hash(password)
     def check_password(self, password): return check_password_hash(self.password_hash, password)
 
 class DeviceType(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(120), unique=True, nullable=False)
-    value = db.Column(db.Float, nullable=False, default=0.0)  # valor por device (ou multiplicador)
+    value = db.Column(db.Float, nullable=False, default=0.0)
 
 class SpliceTier(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     min_splices = db.Column(db.Integer, nullable=False)
-    max_splices = db.Column(db.Integer, nullable=True)  # None = sem teto
+    max_splices = db.Column(db.Integer, nullable=True)
     price_per_splice = db.Column(db.Float, nullable=False, default=0.0)
 
 class Record(db.Model):
@@ -57,7 +54,6 @@ class Record(db.Model):
 @login_manager.user_loader
 def load_user(user_id): return User.query.get(int(user_id))
 
-# --- Helpers ---
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -69,10 +65,10 @@ HEADER_MAP = {
     "created_date": [r"^created(_| )?at$", r"^data\s*de\s*cria[çc][aã]o$", r"^data$", r"^date$", r"^created$"]
 }
 
+import re
 def normalize_col(col: str):
     if col is None: return ""
     return re.sub(r"\s+", " ", str(col).strip()).lower()
-
 def match_target(col: str):
     c = normalize_col(col)
     for target, patterns in HEADER_MAP.items():
@@ -81,6 +77,7 @@ def match_target(col: str):
                 return target
     return None
 
+import pandas as pd
 def parse_dataframe(df: pd.DataFrame, sheet_name: str):
     renamed = {}
     for col in df.columns:
@@ -109,7 +106,6 @@ def parse_dataframe(df: pd.DataFrame, sheet_name: str):
     if "created_date" in sub.columns:
         sub["created_date"] = pd.to_datetime(sub["created_date"], errors="coerce")
     sub["__sheet__"] = sheet_name
-    # Try to coerce splices to int
     if "splices" in sub.columns:
         sub["splices"] = pd.to_numeric(sub["splices"], errors="coerce").fillna(0).astype(int)
     return sub
@@ -127,7 +123,6 @@ def price_for_device_type(type_name: str):
     return dt.value if dt else 0.0
 
 def dataframe_with_prices(df: pd.DataFrame):
-    # Ensure required columns exist
     for col in ["type","splices"]:
         if col not in df.columns: df[col] = None if col=="type" else 0
     df["price_splices"] = df["splices"].apply(lambda n: price_for_splices(int(n) if pd.notna(n) else 0))
@@ -154,30 +149,28 @@ def persist_records(df: pd.DataFrame):
         db.session.bulk_save_objects(rows)
         db.session.commit()
 
-# --- Routes ---
 @app.route("/init-admin")
 def init_admin():
-    # One-time helper to create an initial admin user from env vars or defaults
-    email = os.environ.get("ADMIN_EMAIL", "admin@local")
+    username = os.environ.get("ADMIN_USERNAME", "admin")
     pwd = os.environ.get("ADMIN_PASSWORD", "admin123")
-    if User.query.filter_by(email=email).first():
+    if User.query.filter_by(username=username).first():
         return "Admin já existe."
-    u = User(email=email, is_admin=True)
+    u = User(username=username, is_admin=True)
     u.set_password(pwd)
     db.session.add(u)
     db.session.commit()
-    return f"Admin criado: {email} / {pwd}"
+    return f"Admin criado: {username} / {pwd}"
 
 @app.route("/login", methods=["GET","POST"])
 def login():
     if request.method == "POST":
-        email = request.form.get("email","").strip().lower()
+        username = request.form.get("username","").strip()
         password = request.form.get("password","")
-        user = User.query.filter_by(email=email).first()
+        user = User.query.filter_by(username=username).first()
         if user and user.check_password(password):
             login_user(user)
             return redirect(url_for("index"))
-        flash("Credenciais inválidas.", "error")
+        flash("Usuário ou senha inválidos.", "error")
     return render_template("login.html")
 
 @app.route("/logout")
@@ -200,10 +193,8 @@ def index():
         if not allowed_file(file.filename):
             flash("Formato não suportado. Use .xlsx, .xls ou .csv", "error")
             return redirect(request.url)
-
-        filename = secure_filename(file.filename)
         try:
-            ext = filename.rsplit(".",1)[1].lower()
+            ext = file.filename.rsplit(".",1)[1].lower()
             frames = []
             if ext == "csv":
                 df = pd.read_csv(file)
@@ -217,17 +208,12 @@ def index():
         except Exception as e:
             flash(f"Erro ao ler o arquivo: {e}", "error")
             return redirect(request.url)
-
         priced = dataframe_with_prices(raw.copy())
         persist_records(priced)
-
-        # Prepare HTML + CSV
         disp = priced.copy()
         if "created_date" in disp.columns:
             disp["created_date"] = pd.to_datetime(disp["created_date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         table_html = disp.to_html(index=False, classes="table table-striped table-sm")
-
-        # Store CSV to tmp file for download
         os.makedirs("tmp", exist_ok=True)
         fname = f"resultado_{datetime.now().strftime('%Y%m%d%H%M%S%f')}.csv"
         path = os.path.join("tmp", fname)
@@ -248,7 +234,6 @@ def download(fname):
         return redirect(url_for("index"))
     return send_file(path, as_attachment=True, download_name="resultado_twelve_tech.csv")
 
-# --- Settings: Device Types and Splice Tiers ---
 def admin_required(func):
     from functools import wraps
     @wraps(func)
@@ -276,7 +261,6 @@ def add_device_type():
     if not name:
         flash("Nome do tipo é obrigatório.", "error")
         return redirect(url_for("settings_home"))
-    # Upsert
     existing = DeviceType.query.filter(DeviceType.name.ilike(name)).first()
     if existing:
         existing.value = value
@@ -324,33 +308,15 @@ def delete_splice_tier(tid):
     flash("Faixa de fusões removida.", "success")
     return redirect(url_for("settings_home"))
 
-# --- CLI helper ---
-@app.cli.command("init-db")
-def init_db():
-    db.create_all()
-    print("DB criado. Use /init-admin para criar o admin.")
-
-if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
-    app.run(host="0.0.0.0", port=8000, debug=True)
-
-
-from flask import Response
-from sqlalchemy import and_, func, cast
-from sqlalchemy.types import Date
-
 @app.route("/reports", methods=["GET"])
 @login_required
 def reports():
-    # Filters
     start = request.args.get("start","").strip()
     end = request.args.get("end","").strip()
     map_filter = request.args.get("map","").strip()
     type_filter = request.args.get("type","").strip()
 
     q = Record.query
-    # Date range (uses created_date; fallback to created_at if missing)
     if start:
         try:
             dt = datetime.fromisoformat(start)
@@ -363,21 +329,17 @@ def reports():
             q = q.filter( (Record.created_date <= dt2) | (Record.created_date.is_(None) & (Record.created_at <= dt2)) )
         except Exception:
             flash("Data final inválida. Use YYYY-MM-DD.", "error")
-
     if map_filter:
         q = q.filter(Record.map.ilike(f"%{map_filter}%"))
     if type_filter:
         q = q.filter(Record.type.ilike(f"%{type_filter}%"))
 
-    # Materialize once
     rows = q.all()
 
-    # Helper to coalesce date
+    from collections import defaultdict
     def rec_date(r):
         return (r.created_date or r.created_at).date() if (r.created_date or r.created_at) else None
 
-    # Build aggregations
-    from collections import defaultdict
     agg_day = defaultdict(lambda: {"rows":0,"splices":0,"price_splices":0.0,"price_device":0.0,"total":0.0})
     agg_map = defaultdict(lambda: {"rows":0,"splices":0,"price_splices":0.0,"price_device":0.0,"total":0.0})
     agg_type = defaultdict(lambda: {"rows":0,"splices":0,"price_splices":0.0,"price_device":0.0,"total":0.0})
@@ -405,7 +367,6 @@ def reports():
         agg_type[t]["price_device"] += float(r.price_device or 0.0)
         agg_type[t]["total"] += float(r.total or 0.0)
 
-    # Sort
     day_rows = sorted( (k,v) for k,v in agg_day.items() )
     map_rows = sorted( (k,v) for k,v in agg_map.items() )
     type_rows = sorted( (k,v) for k,v in agg_type.items() )
@@ -417,7 +378,6 @@ def reports():
 @app.route("/reports/export.csv")
 @login_required
 def reports_export():
-    # Same filtering as in /reports
     start = request.args.get("start","").strip()
     end = request.args.get("end","").strip()
     map_filter = request.args.get("map","").strip()
@@ -441,7 +401,6 @@ def reports_export():
     if type_filter:
         q = q.filter(Record.type.ilike(f"%{type_filter}%"))
 
-    # Export raw records
     import csv
     from io import StringIO
     sio = StringIO()
@@ -455,3 +414,14 @@ def reports_export():
     csv_bytes = sio.getvalue().encode("utf-8-sig")
     return Response(csv_bytes, mimetype="text/csv",
                     headers={"Content-Disposition":"attachment; filename=records_export.csv"})
+
+
+@app.cli.command("init-db")
+def init_db():
+    db.create_all()
+    print("DB criado. Use /init-admin para criar o admin.")
+
+if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
+    app.run(host="0.0.0.0", port=8000, debug=True)
