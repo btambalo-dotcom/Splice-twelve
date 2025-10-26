@@ -1,14 +1,15 @@
-
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, render_template, request, redirect, url_for, flash, Response
 from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, login_user, login_required, logout_user, UserMixin
+from flask_login import LoginManager, login_user, login_required, logout_user, current_user, UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 from datetime import datetime
 import os, re
+from collections import defaultdict
+from functools import wraps
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY","dev")
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY","dev-key")
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL","sqlite:///app.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
@@ -19,11 +20,24 @@ class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(64), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
+    is_admin = db.Column(db.Boolean, default=True)
     def set_password(self, p): self.password_hash = generate_password_hash(p)
     def check_password(self, p): return check_password_hash(self.password_hash, p)
 
+class DeviceType(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), unique=True, nullable=False)
+    value = db.Column(db.Float, default=0.0, nullable=False)
+
+class SpliceTier(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    min_splices = db.Column(db.Integer, nullable=False)
+    max_splices = db.Column(db.Integer, nullable=True)
+    price_per_splice = db.Column(db.Float, default=0.0, nullable=False)
+
 class Record(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    sheet = db.Column(db.String(120))
     map = db.Column(db.String(200))
     type = db.Column(db.String(120))
     splices = db.Column(db.Integer)
@@ -31,6 +45,9 @@ class Record(db.Model):
     created_date = db.Column(db.DateTime, nullable=True)
     splicer = db.Column(db.String(120))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    price_splices = db.Column(db.Float, default=0.0)
+    price_device = db.Column(db.Float, default=0.0)
+    total = db.Column(db.Float, default=0.0)
 
 @login_manager.user_loader
 def load_user(uid): return User.query.get(int(uid))
@@ -38,20 +55,16 @@ def load_user(uid): return User.query.get(int(uid))
 with app.app_context():
     db.create_all()
 
-# ---------------- Parsing patched ----------------
+# --------- Parsing (case-insensitive + aliases) ---------
 ALLOWED = {"xlsx","xls","csv"}
-def allowed_file(fn): 
-    return "." in fn and fn.rsplit(".",1)[1].lower() in ALLOWED
+def allowed_file(name): return "." in name and name.rsplit(".",1)[1].lower() in ALLOWED
 
-def _norm(s: str) -> str:
+def _norm(s): 
     base = str(s or "").strip().lower()
-    base = (base.replace("á","a").replace("à","a").replace("â","a").replace("ã","a")
-                 .replace("é","e").replace("ê","e")
-                 .replace("í","i")
-                 .replace("ó","o").replace("ô","o").replace("õ","o")
-                 .replace("ú","u")
-                 .replace("ç","c"))
-    return base
+    return (base.replace("á","a").replace("à","a").replace("â","a").replace("ã","a")
+                .replace("é","e").replace("ê","e").replace("í","i")
+                .replace("ó","o").replace("ô","o").replace("õ","o")
+                .replace("ú","u").replace("ç","c"))
 
 HEADER_ALIASES = {
     "type": {"type","tipo","category","classe"},
@@ -62,26 +75,23 @@ HEADER_ALIASES = {
     "splicer": {"splicer","tecnico","técnico","technician"}
 }
 
-def _rename_by_header(df: pd.DataFrame) -> pd.DataFrame:
+def _rename_by_header(df):
     ren = {}
     for c in df.columns:
         base = _norm(c)
         for target, aliases in HEADER_ALIASES.items():
             if any(a in base for a in aliases):
-                ren[c] = target
-                break
+                ren[c] = target; break
     return df.rename(columns=ren)
 
-def _guess_missing(df: pd.DataFrame) -> pd.DataFrame:
+def _guess_missing(df):
     nunique = df.nunique(dropna=False)
-    # type
     if "type" not in df.columns:
         tokens = {"splice","test","placement","service","splicing"}
         for c in df.columns:
             s = df[c].astype(str).str.strip().str.lower()
             if (s.isin(tokens)).mean() > 0.25:
                 df.rename(columns={c:"type"}, inplace=True); break
-    # splices
     if "splices" not in df.columns:
         best,score=None,-1
         for c in df.columns:
@@ -92,7 +102,6 @@ def _guess_missing(df: pd.DataFrame) -> pd.DataFrame:
             sc   = ints + (1.0 if med<=300 else 0.0)
             if sc>score: best,score=c,sc
         if best: df.rename(columns={best:"splices"}, inplace=True)
-    # device
     if "device" not in df.columns:
         pat = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_/\.\s]{3,}$")
         best,score=None,-1
@@ -102,7 +111,6 @@ def _guess_missing(df: pd.DataFrame) -> pd.DataFrame:
             sc = s.apply(lambda x: bool(pat.match(x)) and not x.isdigit()).mean()
             if sc>score: best,score=c,sc
         if score>=0.25: df.rename(columns={best:"device"}, inplace=True)
-    # map
     if "map" not in df.columns:
         best,score=None,-1
         for c in df.columns:
@@ -113,33 +121,79 @@ def _guess_missing(df: pd.DataFrame) -> pd.DataFrame:
         if best: df.rename(columns={best:"map"}, inplace=True)
     return df
 
-def read_table(upload) -> pd.DataFrame:
-    ext = upload.filename.rsplit(".",1)[1].lower()
-    if ext == "csv":
-        df = pd.read_csv(upload)
-        return _guess_missing(_rename_by_header(df))
-    xl = pd.ExcelFile(upload)
-    frames = []
-    for nm in xl.sheet_names:
-        df0 = xl.parse(nm)
-        frames.append(_guess_missing(_rename_by_header(df0)))
-    return pd.concat(frames, ignore_index=True)
+def parse_sheet(df, name):
+    if hasattr(df.columns, "levels"):
+        df.columns = [" ".join([str(x) for x in t if str(x)!='']) for t in df.columns]
+    df = _rename_by_header(df)
+    df = _guess_missing(df)
+    keep = [c for c in ["type","map","splices","device","created_date","splicer"] if c in df.columns]
+    out = df[keep].copy()
+    if "splices" in out.columns: out["splices"] = pd.to_numeric(out["splices"], errors="coerce").fillna(0).astype(int)
+    if "created_date" in out.columns: out["created_date"] = pd.to_datetime(out["created_date"], errors="coerce")
+    out["__sheet__"] = name
+    return out
 
-# ---------------- Routes ----------------
+def read_table(upload):
+    ext = upload.filename.rsplit(".",1)[1].lower()
+    if ext=="csv":
+        return parse_sheet(pd.read_csv(upload), "CSV")
+    xl = pd.ExcelFile(upload)
+    frames = [parse_sheet(xl.parse(n), n) for n in xl.sheet_names]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["type","map","splices","device","created_date","splicer","__sheet__"])
+
+# --------- Pricing ---------
+def price_for_splices(n):
+    tier = SpliceTier.query.filter((SpliceTier.min_splices <= n) & ((SpliceTier.max_splices >= n) | (SpliceTier.max_splices.is_(None)))).order_by(SpliceTier.min_splices.desc()).first()
+    return (n * tier.price_per_splice) if tier else 0.0
+
+def price_for_device_type(type_name):
+    if not type_name: return 0.0
+    dt = DeviceType.query.filter(DeviceType.name.ilike(str(type_name))).first()
+    return dt.value if dt else 0.0
+
+def apply_prices(df):
+    if "splices" not in df.columns: df["splices"]=0
+    if "type" not in df.columns: df["type"]=None
+    df["price_splices"] = df["splices"].apply(lambda n: price_for_splices(int(n) if pd.notna(n) else 0))
+    df["price_device"] = df["type"].apply(lambda t: price_for_device_type(str(t)) if pd.notna(t) else 0.0)
+    df["total"] = df["price_splices"] + df["price_device"]
+    return df
+
+def persist(df):
+    rows = []
+    for _, r in df.iterrows():
+        rows.append(Record(
+            sheet=str(r.get("__sheet__", "")),
+            map=str(r.get("map") or ""),
+            type=str(r.get("type") or ""),
+            splices=int(r.get("splices") or 0),
+            device=str(r.get("device") or ""),
+            created_date=r.get("created_date") if isinstance(r.get("created_date"), pd.Timestamp) else None,
+            splicer=str(r.get("splicer") or ""),
+            price_splices=float(r.get("price_splices") or 0.0),
+            price_device=float(r.get("price_device") or 0.0),
+            total=float(r.get("total") or 0.0),
+        ))
+    if rows:
+        db.session.bulk_save_objects(rows); db.session.commit()
+
+# --------- Auth & routes ---------
+@login_manager.user_loader
+def user_loader(uid): return User.query.get(int(uid))
+
 @app.route("/init-admin")
 def init_admin():
     user = os.environ.get("ADMIN_USERNAME","admin")
-    pwd  = os.environ.get("ADMIN_PASSWORD","admin123")
+    pwd = os.environ.get("ADMIN_PASSWORD","admin123")
     if not User.query.filter_by(username=user).first():
-        u = User(username=user); u.set_password(pwd)
-        db.session.add(u); db.session.commit()
+        u=User(username=user, is_admin=True); u.set_password(pwd); db.session.add(u); db.session.commit()
         return f"Admin criado: {user} / {pwd}"
     return "Admin já existe."
 
 @app.route("/login", methods=["GET","POST"])
 def login():
     if request.method=="POST":
-        u = User.query.filter_by(username=request.form.get("username","")).first()
+        u=User.query.filter_by(username=request.form.get("username","")).first()
         if u and u.check_password(request.form.get("password","")):
             login_user(u); return redirect(url_for("index"))
         flash("Usuário ou senha inválidos.","error")
@@ -149,36 +203,88 @@ def login():
 @login_required
 def logout(): logout_user(); return redirect(url_for("login"))
 
+def admin_required(fn):
+    @wraps(fn)
+    def w(*a, **k):
+        if not current_user.is_authenticated or not current_user.is_admin:
+            flash("Acesso restrito ao administrador.","error"); return redirect(url_for("index"))
+        return fn(*a, **k)
+    return w
+
 @app.route("/", methods=["GET","POST"])
 @login_required
 def index():
     if request.method=="POST":
         f = request.files.get("file")
-        if not f or f.filename=="":
-            flash("Envie um arquivo .xlsx/.xls/.csv","error"); return redirect(request.url)
-        if not allowed_file(f.filename):
-            flash("Formato não suportado.","error"); return redirect(request.url)
+        if not f or f.filename=="": flash("Envie um arquivo .xlsx/.xls/.csv","error"); return redirect(request.url)
+        if not allowed_file(f.filename): flash("Formato não suportado.","error"); return redirect(request.url)
         try:
             df = read_table(f)
         except Exception as e:
             flash(f"Erro ao ler arquivo: {e}","error"); return redirect(request.url)
-        # persist
-        for _, r in df.iterrows():
-            created = r.get("created_date")
-            if isinstance(created, pd.Timestamp):
-                created = created.to_pydatetime()
-            db.session.add(Record(
-                map=str(r.get("map") or ""),
-                type=str(r.get("type") or ""),
-                splices=int(r.get("splices") or 0),
-                device=str(r.get("device") or ""),
-                created_date=created,
-                splicer=str(r.get("splicer") or "")
-            ))
-        db.session.commit()
-        return render_template("results.html", table_html=df.to_html(index=False, classes="table table-striped table-sm"))
-    count = Record.query.count()
-    return render_template("upload.html", total_rows=count)
+        df = apply_prices(df); persist(df)
+        html = df.to_html(index=False, classes="table table-striped table-sm")
+        return render_template("results.html", table_html=html)
+    totals = db.session.query(db.func.count(Record.id), db.func.sum(Record.total)).first()
+    return render_template("upload.html", total_rows=totals[0] or 0, total_amount=totals[1] or 0.0)
+
+@app.route("/settings")
+@login_required
+@admin_required
+def settings_home():
+    return render_template("settings.html",
+        types=DeviceType.query.order_by(DeviceType.name).all(),
+        tiers=SpliceTier.query.order_by(SpliceTier.min_splices).all())
+
+@app.route("/settings/device-type", methods=["POST"])
+@login_required
+@admin_required
+def add_device_type():
+    name = request.form.get("name","").strip()
+    value = float(request.form.get("value","0") or 0)
+    if not name: flash("Nome do tipo é obrigatório.","error"); return redirect(url_for("settings_home"))
+    obj = DeviceType.query.filter(DeviceType.name.ilike(name)).first()
+    if obj: obj.value = value
+    else: db.session.add(DeviceType(name=name, value=value))
+    db.session.commit(); flash("Tipo salvo.","success"); return redirect(url_for("settings_home"))
+
+@app.route("/settings/device-type/delete/<int:tid>")
+@login_required
+@admin_required
+def del_device_type(tid):
+    obj = DeviceType.query.get_or_404(tid); db.session.delete(obj); db.session.commit()
+    flash("Tipo removido.","success"); return redirect(url_for("settings_home"))
+
+@app.route("/settings/splice-tier", methods=["POST"])
+@login_required
+@admin_required
+def add_splice_tier():
+    min_s = int(request.form.get("min_splices","0") or 0)
+    max_raw = request.form.get("max_splices","").strip()
+    max_s = int(max_raw) if max_raw else None
+    price = float(request.form.get("price_per_splice","0") or 0)
+    db.session.add(SpliceTier(min_splices=min_s, max_splices=max_s, price_per_splice=price))
+    db.session.commit(); flash("Faixa salva.","success"); return redirect(url_for("settings_home"))
+
+@app.route("/settings/splice-tier/delete/<int:tid>")
+@login_required
+@admin_required
+def del_splice_tier(tid):
+    obj = SpliceTier.query.get_or_404(tid); db.session.delete(obj); db.session.commit()
+    flash("Faixa removida.","success"); return redirect(url_for("settings_home"))
+
+@app.route("/reports")
+@login_required
+def reports():
+    rows = Record.query.all()
+    agg_map = defaultdict(lambda: {"rows":0,"splices":0,"total":0.0})
+    agg_type = defaultdict(lambda: {"rows":0,"splices":0,"total":0.0})
+    for r in rows:
+        m = r.map or "—"; t = r.type or "—"
+        agg_map[m]["rows"] += 1; agg_map[m]["splices"] += int(r.splices or 0); agg_map[m]["total"] += float(r.total or 0.0)
+        agg_type[t]["rows"] += 1; agg_type[t]["splices"] += int(r.splices or 0); agg_type[t]["total"] += float(r.total or 0.0)
+    return render_template("reports.html",
+        map_rows=sorted(agg_map.items()), type_rows=sorted(agg_type.items()))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
