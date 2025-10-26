@@ -1,22 +1,6 @@
-{% extends 'base.html' %}
-{% block title %}Entrar · Twelve Tech{% endblock %}
-{% block content %}
-<div class="row justify-content-center">
-  <div class="col-md-6">
-    <div class="card p-4 shadow">
-      <h3 class="mb-3">Entrar</h3>
-      <form method="post">
-        <div class="mb-3">
-          <label class="form-label">Usuário</label>
-          <input class="form-control" name="username" required>
-        </div>
-        <div class="mb-3">
-          <label class="form-label">Senha</label>
-          <input class="form-control" type="password" name="password" required>
-        </div>
-        <button class="btn btn-primary w-100">Entrar</button>
-      </form>
-    </div>
-  </div>
-</div>
-{% endblock %}
+{% extends 'base.html' %}{% block content %}
+<div class="row justify-content-center"><div class="col-md-6">
+<div class="card p-4 shadow"><h3>Entrar</h3>
+<form method="post"><div class="mb-3"><label>Usuário</label><input class="form-control" name="username" required></div>
+<div class="mb-3"><label>Senha</label><input class="form-control" type="password" name="password" required></div>
+<button class="btn btn-primary w-100">Entrar</button></form></div></div></div>{% endblock %}
