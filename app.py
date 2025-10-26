@@ -10,10 +10,12 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.resolve()
 EXPORT_DIR = BASE_DIR / 'exports'
 EXPORT_DIR.mkdir(exist_ok=True)
+# >>> SQLite em /tmp (Render permite escrita aqui) <<<
+SQLITE_PATH = Path('/tmp/app.db')
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY','dev-key')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL','sqlite:///app.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{SQLITE_PATH}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
@@ -41,10 +43,12 @@ class Record(db.Model):
 @login_manager.user_loader
 def load_user(uid): return User.query.get(int(uid))
 
+# Inicializa o banco de forma segura no boot
 with app.app_context():
+    SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     db.create_all()
 
-# ---------- Helpers ----------
+# ---------- Parsing helpers ----------
 ALLOWED={'xlsx','xls','csv'}
 def allowed_file(n): return '.' in n and n.rsplit('.',1)[1].lower() in ALLOWED
 
@@ -76,23 +80,19 @@ HEADER_ALIASES = {
 }
 
 def rename_headers(df):
-    # First, deduplicate any duplicate names coming from source
     df.columns = make_unique(df.columns)
     ren = {}
     for c in df.columns:
         base = _norm(c)
         for target, aliases in HEADER_ALIASES.items():
             if any(a == base or a in base for a in aliases):
-                # avoid overwriting an existing mapped target: keep unique by suffix
-                target_name = target if target not in ren.values() and target not in df.columns else f"{target}_2"
-                ren[c] = target_name; break
+                # Evita colisão de nomes mapeados
+                t = target if target not in df.columns else f"{target}_2"
+                ren[c] = t; break
     df = df.rename(columns=ren)
-    # If we created *_2 due to duplicates, prefer the first one
-    prefer = {}
-    for c in df.columns:
-        if c.endswith('_2') and c[:-2] in df.columns:
-            # drop the *_2 since base exists
-            df.drop(columns=[c], inplace=True)
+    # Remove *_2 se o original existe
+    dropcols = [c for c in df.columns if c.endswith('_2') and c[:-2] in df.columns]
+    if dropcols: df.drop(columns=dropcols, inplace=True)
     return df
 
 def guess_missing(df):
@@ -113,6 +113,7 @@ def guess_missing(df):
             if sc>score: best,score=c,sc
         if best: df.rename(columns={best:'splices'}, inplace=True)
     if 'device' not in df.columns:
+        import re
         pat = re.compile(r'^[A-Za-z0-9][A-Za-z0-9\-_/\.\s]{3,}$')
         best,score=None,-1
         for c in df.columns:
@@ -157,10 +158,7 @@ def read_table(upload):
     frames = [finalize(xl.parse(n), n) for n in xl.sheet_names]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=['type','map','splices','device','created_date','splicer','__sheet__'])
 
-# ---------- Routes ----------
-@login_manager.user_loader
-def user_loader(uid): return User.query.get(int(uid))
-
+# ---------- Auth & routes ----------
 @app.route('/init-admin')
 def init_admin():
     user = os.environ.get('ADMIN_USERNAME','admin'); pwd = os.environ.get('ADMIN_PASSWORD','admin123')
@@ -168,6 +166,9 @@ def init_admin():
         u=User(username=user, is_admin=True); u.set_password(pwd); db.session.add(u); db.session.commit()
         return f'Admin criado: {user} / {pwd}'
     return 'Admin já existe.'
+
+@login_manager.user_loader
+def user_loader(uid): return User.query.get(int(uid))
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -200,13 +201,11 @@ def index():
         df.to_csv(csv_path, index=False)
         with pd.ExcelWriter(xlsx_path, engine='openpyxl') as w:
             df.to_excel(w, index=False, sheet_name='dados')
-
         session['last_token'] = token
         table_html = df.head(100).to_html(index=False, classes='table table-striped table-sm')
         return render_template('results.html', table_html=table_html, token=token)
 
-    # summary (not computing totals here)
-    total = db.session.query(db.func.count(Record.id)).scalar() or 0
+    total = 0
     return render_template('upload.html', total_rows=total, total_amount=0)
 
 @app.route('/download/csv/<token>')
