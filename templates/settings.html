@@ -1,7 +1,7 @@
 {% extends 'base.html' %}{% block content %}
 <h3>Configurações</h3>
 <div class="row g-4">
-  <div class="col-md-6"><div class="card p-4 shadow">
+  <div class="col-md-6"><div class="card p-4 bg-secondary-subtle text-dark">
     <h5>Tipos de Device</h5>
     <form method="post" action="{{ url_for('add_device_type') }}" class="row g-2">
       <div class="col-7"><input class="form-control" name="name" placeholder="Ex.: ONT, CTO" required></div>
@@ -10,10 +10,10 @@
     </form>
     <table class="table table-sm mt-3"><thead><tr><th>Tipo</th><th>Valor</th><th></th></tr></thead>
       <tbody>{% for t in types %}<tr><td>{{ t.name }}</td><td>R$ {{ '%.2f'|format(t.value) }}</td>
-      <td class="text-end"><a class="btn btn-outline-danger btn-sm" href="{{ url_for('del_device_type', tid=t.id) }}">Excluir</a></td></tr>
-      {% else %}<tr><td colspan="3" class="text-muted">Nenhum tipo cadastrado.</td></tr>{% endfor %}</tbody></table>
+      <td class="text-end"><a class="btn btn-sm btn-danger" href="{{ url_for('del_device_type', tid=t.id) }}">Excluir</a></td></tr>
+      {% else %}<tr><td colspan="3" class="text-muted">Nenhum tipo.</td></tr>{% endfor %}</tbody></table>
   </div></div>
-  <div class="col-md-6"><div class="card p-4 shadow">
+  <div class="col-md-6"><div class="card p-4 bg-secondary-subtle text-dark">
     <h5>Faixas de Fusões</h5>
     <form method="post" action="{{ url_for('add_splice_tier') }}" class="row g-2">
       <div class="col-4"><input class="form-control" name="min_splices" type="number" min="0" placeholder="Mín." required></div>
@@ -24,8 +24,8 @@
     <table class="table table-sm mt-3"><thead><tr><th>Faixa</th><th>R$/fusão</th><th></th></tr></thead>
       <tbody>{% for s in tiers %}<tr><td>{{ s.min_splices }} – {{ s.max_splices if s.max_splices is not none else "∞" }}</td>
       <td>R$ {{ '%.2f'|format(s.price_per_splice) }}</td>
-      <td class="text-end"><a class="btn btn-outline-danger btn-sm" href="{{ url_for('del_splice_tier', tid=s.id) }}">Excluir</a></td></tr>
-      {% else %}<tr><td colspan="3" class="text-muted">Nenhuma faixa cadastrada.</td></tr>{% endfor %}</tbody></table>
+      <td class="text-end"><a class="btn btn-sm btn-danger" href="{{ url_for('del_splice_tier', tid=s.id) }}">Excluir</a></td></tr>
+      {% else %}<tr><td colspan="3" class="text-muted">Nenhuma faixa.</td></tr>{% endfor %}</tbody></table>
   </div></div>
 </div>
 {% endblock %}

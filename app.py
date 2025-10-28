@@ -1,12 +1,12 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, send_file, session
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user, UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 from datetime import datetime
-from collections import defaultdict
-import os, re, uuid, io
+import os, uuid
 from pathlib import Path
+from io import BytesIO
 
 BASE_DIR = Path(__file__).parent.resolve()
 EXPORT_DIR = BASE_DIR / 'exports'
@@ -62,136 +62,26 @@ with app.app_context():
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     db.create_all()
 
-# ---------- Parsing helpers ----------
-ALLOWED={'xlsx','xls','csv'}
-def allowed_file(n): return '.' in n and n.rsplit('.',1)[1].lower() in ALLOWED
+ALLOWED={'xlsx'}
+REQUIRED = ['Type','Map','Splices','Device','Splicer','Created']
 
-def _norm(s):
-    base = str(s or '').strip().strip('"').strip("'").lower()
-    return (base.replace('á','a').replace('à','a').replace('â','a').replace('ã','a')
-                .replace('é','e').replace('ê','e').replace('í','i')
-                .replace('ó','o').replace('ô','o').replace('õ','o')
-                .replace('ú','u').replace('ç','c'))
-
-def make_unique(cols):
-    seen = {}
-    out = []
-    for c in cols:
-        base = str(c)
-        if base not in seen:
-            seen[base]=1; out.append(base)
-        else:
-            seen[base]+=1; out.append(f"{base}_{seen[base]}")
+def parse_excel_exact(upload):
+    raw = upload.read()
+    xls = pd.ExcelFile(BytesIO(raw))
+    sheet = 'Sheet1'
+    if sheet not in xls.sheet_names:
+        raise ValueError('A aba "Sheet1" não foi encontrada')
+    df = xls.parse(sheet)
+    df.columns = [str(c).strip() for c in df.columns]
+    missing = [c for c in REQUIRED if c not in df.columns]
+    if missing:
+        raise ValueError('Colunas ausentes: ' + ', '.join(missing))
+    out = df[REQUIRED].copy()
+    out['Splices'] = pd.to_numeric(out['Splices'], errors='coerce').fillna(0).astype(int)
+    out['Created'] = pd.to_datetime(out['Created'], errors='coerce')
+    out['__sheet__'] = sheet
     return out
 
-HEADER_ALIASES = {
-    'type': {'type','tipo','category','classe'},
-    'map': {'map','mapa','map name','nome do mapa'},
-    'splices': {'splices','splice','fusoes','fusao','fusões','fusão','qtd fusoes','splice count','splice qty','qty'},
-    'device': {'device','dispositivo','equipamento','serial'},
-    'created_date': {'created','created_at','data','date','created date'},
-    'splicer': {'splicer','tecnico','técnico','technician'}
-}
-
-def sanitize_columns(df):
-    df.columns = [str(c).strip().strip('"').strip("'") for c in df.columns]
-    df = df.loc[:, ~pd.Index(df.columns).duplicated()]
-    df.columns = make_unique(df.columns)
-    return df
-
-def rename_headers(df):
-    df = sanitize_columns(df)
-    ren = {}
-    for c in df.columns:
-        base = _norm(c)
-        for target, aliases in HEADER_ALIASES.items():
-            if any((base == _norm(a)) or (_norm(a) in base) for a in aliases):
-                t = target if target not in df.columns else f"{target}_2"
-                ren[c] = t; break
-    df = df.rename(columns=ren)
-    dropcols = [c for c in df.columns if c.endswith('_2') and c[:-2] in df.columns]
-    if dropcols: df.drop(columns=dropcols, inplace=True)
-    return df
-
-def guess_missing(df):
-    nunique = df.nunique(dropna=False)
-    if 'type' not in df.columns:
-        tokens={'splice','test','placement','service','splicing'}
-        for c in df.columns:
-            s = df[c].astype(str).str.strip().str.lower()
-            if (s.isin(tokens)).mean() > 0.25: df.rename(columns={c:'type'}, inplace=True); break
-    if 'splices' not in df.columns:
-        best,score=None,-1
-        for c in df.columns:
-            nums = pd.to_numeric(df[c], errors='coerce')
-            if nums.notna().mean() < 0.4: continue
-            ints = (nums.dropna()%1==0).mean()
-            med  = nums.dropna().median() if not nums.dropna().empty else 0
-            sc   = ints + (1.0 if med<=300 else 0.0)
-            if sc>score: best,score=c,sc
-        if best: df.rename(columns={best:'splices'}, inplace=True)
-    if 'device' not in df.columns:
-        import re
-        pat = re.compile(r'^[A-Za-z0-9][A-Za-z0-9\-_/\.\s]{3,}$')
-        best,score=None,-1
-        for c in df.columns:
-            if nunique[c] <= 1: continue
-            s = df[c].astype(str).str.strip()
-            sc = s.apply(lambda x: bool(pat.match(x)) and not x.isdigit()).mean()
-            if sc>score: best,score=c,sc
-        if score>=0.25: df.rename(columns={best:'device'}, inplace=True)
-    if 'map' not in df.columns:
-        best,score=None,-1
-        for c in df.columns:
-            if nunique[c] <= 1: continue
-            s = df[c].astype(str)
-            sc = s.str.contains(',', na=False).mean()*1.5 + (s.str.len().median()/80.0)
-            if sc>score: best,score=c,sc
-        if best: df.rename(columns={best:'map'}, inplace=True)
-    return df
-
-REQUIRED = ['type','map','splices','device','created_date','splicer']
-
-def ensure_required(df):
-    for c in REQUIRED:
-        if c not in df.columns:
-            df[c] = None if c!='splices' else 0
-    df['splices'] = pd.to_numeric(df['splices'], errors='coerce').fillna(0).astype(int)
-    return df
-
-def finalize(df, sheet_name):
-    if hasattr(df.columns, 'levels'):
-        df.columns = [' '.join([str(x) for x in t if str(x)!='']) for t in df.columns]
-    df = sanitize_columns(df)
-    df = rename_headers(df)
-    df = guess_missing(df)
-    df = ensure_required(df)
-    df['__sheet__'] = sheet_name
-    return df[REQUIRED + ['__sheet__']]
-
-def try_read_csv(upload):
-    # Try multiple separators; handle BOM
-    raw = upload.read()
-    # reset stream for potential Excel read later
-    from io import BytesIO
-    b = BytesIO(raw)
-    for sep in [None, ',', ';', '	']:
-        try:
-            b.seek(0)
-            df = pd.read_csv(b, sep=sep, engine='python', quotechar='"', skipinitialspace=True)
-            return finalize(df, 'CSV')
-        except Exception:
-            continue
-    raise ValueError('CSV inválido')
-
-def read_table(upload):
-    ext = upload.filename.rsplit('.',1)[1].lower()
-    if ext=='csv':
-        return try_read_csv(upload)
-    # Excel
-    return finalize(pd.concat([pd.read_excel(upload, sheet_name=None)[s] for s in pd.read_excel(upload, sheet_name=None)], ignore_index=True), 'EXCEL')
-
-# ---------- Pricing ----------
 def price_for_splices(n):
     tier = SpliceTier.query.filter((SpliceTier.min_splices <= n) & ((SpliceTier.max_splices >= n) | (SpliceTier.max_splices.is_(None)))).order_by(SpliceTier.min_splices.desc()).first()
     return (n * tier.price_per_splice) if tier else 0.0
@@ -201,27 +91,23 @@ def price_for_device_type(type_name):
     return dt.value if dt else 0.0
 
 def apply_prices(df):
-    # Safe even if columns empty
-    splices_series = pd.to_numeric(df.get('splices', 0), errors='coerce').fillna(0).astype(int)
-    types_series = df.get('type', '').astype(str)
-    df['price_splices'] = splices_series.apply(lambda n: price_for_splices(int(n)))
-    df['price_device'] = types_series.apply(lambda t: price_for_device_type(str(t)))
+    df['price_splices'] = df['Splices'].apply(lambda n: price_for_splices(int(n)))
+    df['price_device'] = df['Type'].astype(str).apply(lambda t: price_for_device_type(str(t)))
     df['total'] = df['price_splices'] + df['price_device']
     return df
 
 def persist(df):
     rows=[]
     for _, r in df.iterrows():
-        rows.append(Record(sheet=str(r.get('__sheet__','')), map=str(r.get('map') or ''), type=str(r.get('type') or ''),
-                           splices=int(r.get('splices') or 0), device=str(r.get('device') or ''),
-                           created_date=r.get('created_date') if isinstance(r.get('created_date'), pd.Timestamp) else None,
-                           splicer=str(r.get('splicer') or ''),
+        rows.append(Record(sheet=str(r.get('__sheet__','')), map=str(r.get('Map') or ''), type=str(r.get('Type') or ''),
+                           splices=int(r.get('Splices') or 0), device=str(r.get('Device') or ''),
+                           created_date=r.get('Created') if pd.notna(r.get('Created')) else None,
+                           splicer=str(r.get('Splicer') or ''),
                            price_splices=float(r.get('price_splices') or 0.0), price_device=float(r.get('price_device') or 0.0),
                            total=float(r.get('total') or 0.0)))
     if rows:
         db.session.bulk_save_objects(rows); db.session.commit()
 
-# ---------- Routes ----------
 @app.route('/init-admin')
 def init_admin():
     user = os.environ.get('ADMIN_USERNAME','admin'); pwd = os.environ.get('ADMIN_PASSWORD','admin123')
@@ -229,6 +115,8 @@ def init_admin():
         u=User(username=user, is_admin=True); u.set_password(pwd); db.session.add(u); db.session.commit()
         return f'Admin criado: {user} / {pwd}'
     return 'Admin já existe.'
+
+from flask import render_template_string
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -248,26 +136,23 @@ def logout(): logout_user(); return redirect(url_for('login'))
 def index():
     if request.method=='POST':
         f = request.files.get('file')
-        if not f or f.filename=='': flash('Envie um arquivo .csv/.xlsx/.xls','error'); return redirect(request.url)
-        if not allowed_file(f.filename): flash('Formato não suportado.','error'); return redirect(request.url)
+        if not f or f.filename=='':
+            flash('Envie um arquivo .xlsx','error'); return redirect(url_for('index'))
+        ext = f.filename.rsplit('.',1)[1].lower()
+        if ext not in ALLOWED:
+            flash('Somente .xlsx é permitido','error'); return redirect(url_for('index'))
         try:
-            df = read_table(f)
+            df = parse_excel_exact(f)
             df = apply_prices(df)
             persist(df)
         except Exception as e:
-            flash(f'Erro ao ler arquivo: {e}','error'); return redirect(request.url)
-
+            flash(f'Erro ao ler planilha: {e}','error'); return redirect(url_for('index'))
         token = uuid.uuid4().hex
-        csv_path = EXPORT_DIR / f'clean_{token}.csv'
-        xlsx_path = EXPORT_DIR / f'clean_{token}.xlsx'
-        df.to_csv(csv_path, index=False)
-        with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='dados')
-
-        session['last_token'] = token
+        (EXPORT_DIR/f'clean_{token}.csv').write_text(df.to_csv(index=False), encoding='utf-8')
+        with pd.ExcelWriter(EXPORT_DIR/f'clean_{token}.xlsx', engine='openpyxl') as w:
+            df.to_excel(w, index=False, sheet_name='dados')
         table_html = df.head(100).to_html(index=False, classes='table table-striped table-sm')
         return render_template('results.html', table_html=table_html, token=token)
-
     from sqlalchemy import func
     totals = db.session.query(func.count(Record.id), func.sum(Record.total)).first()
     return render_template('upload.html', total_rows=totals[0] or 0, total_amount=totals[1] or 0.0)
@@ -276,18 +161,12 @@ def index():
 @login_required
 def download_csv(token):
     path = EXPORT_DIR / f'clean_{token}.csv'
-    if not path.exists():
-        flash('Arquivo não encontrado. Envie novamente o arquivo para processar.','error')
-        return redirect(url_for('index'))
     return send_file(path, as_attachment=True, download_name='dados_limpos.csv')
 
 @app.route('/download/xlsx/<token>')
 @login_required
 def download_xlsx(token):
     path = EXPORT_DIR / f'clean_{token}.xlsx'
-    if not path.exists():
-        flash('Arquivo não encontrado. Envie novamente o arquivo para processar.','error')
-        return redirect(url_for('index'))
     return send_file(path, as_attachment=True, download_name='dados_limpos.xlsx')
 
 @app.route('/settings')
@@ -302,8 +181,6 @@ def settings_home():
 def add_device_type():
     name = request.form.get('name','').strip()
     value = float(request.form.get('value','0') or 0)
-    if not name:
-        flash('Nome do tipo é obrigatório.','error'); return redirect(url_for('settings_home'))
     obj = DeviceType.query.filter(DeviceType.name.ilike(name)).first()
     if obj: obj.value = value
     else: db.session.add(DeviceType(name=name, value=value))

@@ -1,11 +1,11 @@
 {% extends 'base.html' %}{% block content %}
-<div class="d-flex flex-wrap justify-content-between align-items-center mb-3">
-  <h3>Resultados extraídos</h3>
-  <div class="d-flex gap-2">
-    <a class="btn btn-success btn-sm" href="{{ url_for('download_csv', token=token) }}">Baixar CSV limpo</a>
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3>Resultados</h3>
+  <div>
+    <a class="btn btn-success btn-sm" href="{{ url_for('download_csv', token=token) }}">Baixar CSV</a>
     <a class="btn btn-success btn-sm" href="{{ url_for('download_xlsx', token=token) }}">Baixar Excel</a>
-    <a class="btn btn-outline-light btn-sm" href="{{ url_for('index') }}">Processar outro</a>
+    <a class="btn btn-outline-light btn-sm" href="{{ url_for('index') }}">Novo upload</a>
   </div>
 </div>
-<div class="card p-0 shadow"><div class="table-responsive" style="max-height:70vh;">{{ table_html|safe }}</div></div>
+<div class="card p-2 bg-secondary-subtle text-dark"><div class="table-responsive" style="max-height:70vh">{{ table_html|safe }}</div></div>
 {% endblock %}
