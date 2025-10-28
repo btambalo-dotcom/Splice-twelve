@@ -11,7 +11,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.resolve()
 EXPORT_DIR = BASE_DIR / 'exports'
 EXPORT_DIR.mkdir(exist_ok=True)
-SQLITE_PATH = Path('/tmp/app.db')  # Render-friendly
+SQLITE_PATH = Path('/tmp/app.db')
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY','dev-key')
@@ -21,7 +21,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 login_manager = LoginManager(app); login_manager.login_view = 'login'
 
-# --------- Models ---------
+# ---------- Models ----------
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(64), unique=True, nullable=False)
@@ -62,12 +62,12 @@ with app.app_context():
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     db.create_all()
 
-# --------- Parsing helpers ---------
+# ---------- Helpers ----------
 ALLOWED={'xlsx','xls','csv'}
 def allowed_file(n): return '.' in n and n.rsplit('.',1)[1].lower() in ALLOWED
 
 def _norm(s):
-    base = str(s or '').strip().lower()
+    base = str(s or '').strip().strip('"').strip("'").lower()
     return (base.replace('á','a').replace('à','a').replace('â','a').replace('ã','a')
                 .replace('é','e').replace('ê','e').replace('í','i')
                 .replace('ó','o').replace('ô','o').replace('õ','o')
@@ -93,13 +93,22 @@ HEADER_ALIASES = {
     'splicer': {'splicer','tecnico','técnico','technician'}
 }
 
-def rename_headers(df):
+def sanitize_columns(df):
+    # strip quotes/whitespace
+    df.columns = [str(c).strip().strip('"').strip("'") for c in df.columns]
+    # drop exact duplicates (keeps first)
+    df = df.loc[:, ~pd.Index(df.columns).duplicated()]
+    # ensure uniqueness
     df.columns = make_unique(df.columns)
+    return df
+
+def rename_headers(df):
+    df = sanitize_columns(df)
     ren = {}
     for c in df.columns:
         base = _norm(c)
         for target, aliases in HEADER_ALIASES.items():
-            if any(a == base or a in base for a in aliases):
+            if any((base == _norm(a)) or (_norm(a) in base) for a in aliases):
                 t = target if target not in df.columns else f"{target}_2"
                 ren[c] = t; break
     df = df.rename(columns=ren)
@@ -147,11 +156,14 @@ def guess_missing(df):
 def finalize(df, sheet_name):
     if hasattr(df.columns, 'levels'):
         df.columns = [' '.join([str(x) for x in t if str(x)!='']) for t in df.columns]
-    df.columns = make_unique(df.columns)
+    df = sanitize_columns(df)
     df = rename_headers(df)
     df = guess_missing(df)
     wanted = ['type','map','splices','device','created_date','splicer']
-    out = df.reindex(columns=[c for c in wanted if c in df.columns]).copy()
+    # Keep only known/wanted columns to avoid reindex error paths
+    keep = [c for c in df.columns if c in wanted]
+    df = df[keep] if keep else pd.DataFrame(columns=wanted)
+    out = df.copy()
     if 'splices' not in out.columns: out['splices'] = 0
     if 'type' not in out.columns: out['type'] = None
     if 'map' not in out.columns: out['map'] = None
@@ -164,25 +176,27 @@ def finalize(df, sheet_name):
 def read_table(upload):
     ext = upload.filename.rsplit('.',1)[1].lower()
     if ext=='csv':
-        df = pd.read_csv(upload, sep=None, engine='python')
+        df = pd.read_csv(upload, sep=None, engine='python', quotechar='"', skipinitialspace=True)
         return finalize(df, 'CSV')
     xl = pd.ExcelFile(upload)
     frames = [finalize(xl.parse(n), n) for n in xl.sheet_names]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=['type','map','splices','device','created_date','splicer','__sheet__'])
 
-# --------- Pricing helpers ---------
-def price_for_splices(n):
-    tier = SpliceTier.query.filter((SpliceTier.min_splices <= n) & ((SpliceTier.max_splices >= n) | (SpliceTier.max_splices.is_(None)))).order_by(SpliceTier.min_splices.desc()).first()
-    return (n * tier.price_per_splice) if tier else 0.0
-
-def price_for_device_type(type_name):
-    if not type_name: return 0.0
-    dt = DeviceType.query.filter(DeviceType.name.ilike(str(type_name))).first()
-    return dt.value if dt else 0.0
+# ---------- Pricing ----------
+class PricingMixin:
+    @staticmethod
+    def price_for_splices(n):
+        tier = SpliceTier.query.filter((SpliceTier.min_splices <= n) & ((SpliceTier.max_splices >= n) | (SpliceTier.max_splices.is_(None)))).order_by(SpliceTier.min_splices.desc()).first()
+        return (n * tier.price_per_splice) if tier else 0.0
+    @staticmethod
+    def price_for_device_type(type_name):
+        if not type_name: return 0.0
+        dt = DeviceType.query.filter(DeviceType.name.ilike(str(type_name))).first()
+        return dt.value if dt else 0.0
 
 def apply_prices(df):
-    df['price_splices'] = df['splices'].apply(lambda n: price_for_splices(int(n) if pd.notna(n) else 0))
-    df['price_device'] = df['type'].apply(lambda t: price_for_device_type(str(t)) if pd.notna(t) else 0.0)
+    df['price_splices'] = df['splices'].apply(lambda n: PricingMixin.price_for_splices(int(n) if pd.notna(n) else 0))
+    df['price_device'] = df['type'].apply(lambda t: PricingMixin.price_for_device_type(str(t)) if pd.notna(t) else 0.0)
     df['total'] = df['price_splices'] + df['price_device']
     return df
 
@@ -198,7 +212,7 @@ def persist(df):
     if rows:
         db.session.bulk_save_objects(rows); db.session.commit()
 
-# --------- Routes ---------
+# ---------- Routes ----------
 @app.route('/init-admin')
 def init_admin():
     user = os.environ.get('ADMIN_USERNAME','admin'); pwd = os.environ.get('ADMIN_PASSWORD','admin123')
@@ -244,7 +258,8 @@ def index():
         table_html = df.head(100).to_html(index=False, classes='table table-striped table-sm')
         return render_template('results.html', table_html=table_html, token=token)
 
-    totals = db.session.query(db.func.count(Record.id), db.func.sum(Record.total)).first()
+    from sqlalchemy import func
+    totals = db.session.query(func.count(Record.id), func.sum(Record.total)).first()
     return render_template('upload.html', total_rows=totals[0] or 0, total_amount=totals[1] or 0.0)
 
 @app.route('/download/csv/<token>')
@@ -310,6 +325,7 @@ def del_splice_tier(tid):
 @login_required
 def reports():
     rows = Record.query.all()
+    from collections import defaultdict
     agg_map = defaultdict(lambda: {'rows':0,'splices':0,'total':0.0})
     agg_type = defaultdict(lambda: {'rows':0,'splices':0,'total':0.0})
     for r in rows:
