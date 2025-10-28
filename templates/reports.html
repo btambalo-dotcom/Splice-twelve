@@ -1,5 +1,27 @@
 {% extends 'base.html' %}{% block content %}
 <h3>Relatórios</h3>
+
+<form method="get" class="row g-2 align-items-end mb-3">
+  <div class="col-sm-3">
+    <label class="form-label">De</label>
+    <input class="form-control" type="date" name="start" value="{{ start or '' }}">
+  </div>
+  <div class="col-sm-3">
+    <label class="form-label">Até</label>
+    <input class="form-control" type="date" name="end" value="{{ end or '' }}">
+  </div>
+  <div class="col-sm-6">
+    <button class="btn btn-primary me-2">Filtrar</button>
+    <a class="btn btn-outline-light" href="{{ url_for('reports') }}">Limpar</a>
+  </div>
+</form>
+
+<div class="kpi mb-4">
+  <div class="box"><span>Linhas no período</span><h2>{{ total_rows }}</h2></div>
+  <div class="box"><span>Fusões no período</span><h2>{{ total_splices }}</h2></div>
+  <div class="box"><span>Total ($) no período</span><h2>$ {{ '%.2f'|format(total_usd or 0) }}</h2></div>
+</div>
+
 <div class="row g-4">
   <div class="col-md-6"><div class="card p-3">
     <h5>Por MAP</h5>

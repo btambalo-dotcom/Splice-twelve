@@ -85,7 +85,6 @@ def parse_excel(upload):
     return out
 
 def tier_price_for(count):
-    # count is the chargeable splices (after discounting the first one)
     tier = SpliceTier.query.filter((SpliceTier.min_splices <= count) & ((SpliceTier.max_splices >= count) | (SpliceTier.max_splices.is_(None)))).order_by(SpliceTier.min_splices.desc()).first()
     return tier.price_per_splice_usd if tier else 0.0
 
@@ -179,51 +178,47 @@ def download_xlsx(token):
     path = EXPORT_DIR / f'clean_{token}.xlsx'
     return send_file(path, as_attachment=True, download_name='dados_limpos.xlsx')
 
-# ---------- Devices ----------
-@app.route('/devices')
+# ---------- Settings (Devices + Tiers) ----------
+@app.route('/settings')
 @login_required
-def devices_home():
-    return render_template('devices.html', types=DeviceType.query.order_by(DeviceType.name).all())
+def settings_home():
+    types = DeviceType.query.order_by(DeviceType.name).all()
+    tiers = SpliceTier.query.order_by(SpliceTier.min_splices).all()
+    return render_template('settings.html', types=types, tiers=tiers)
 
-@app.route('/devices/add', methods=['POST'])
+@app.route('/settings/devices/add', methods=['POST'])
 @login_required
-def devices_add():
+def settings_devices_add():
     name = request.form.get('name','').strip()
     val = float(request.form.get('value_usd','0') or 0)
     if not name:
-        flash('Nome obrigatório.','error'); return redirect(url_for('devices_home'))
+        flash('Nome obrigatório.','error'); return redirect(url_for('settings_home'))
     obj = DeviceType.query.filter(DeviceType.name.ilike(name)).first()
     if obj: obj.value_usd = val
     else: db.session.add(DeviceType(name=name, value_usd=val))
-    db.session.commit(); flash('Salvo.','success'); return redirect(url_for('devices_home'))
+    db.session.commit(); flash('Dispositivo salvo.','success'); return redirect(url_for('settings_home'))
 
-@app.route('/devices/delete/<int:tid>')
+@app.route('/settings/devices/delete/<int:tid>')
 @login_required
-def devices_del(tid):
+def settings_devices_del(tid):
     obj = DeviceType.query.get_or_404(tid); db.session.delete(obj); db.session.commit()
-    flash('Removido.','success'); return redirect(url_for('devices_home'))
+    flash('Dispositivo removido.','success'); return redirect(url_for('settings_home'))
 
-# ---------- Splice tiers ----------
-@app.route('/splices')
+@app.route('/settings/tiers/add', methods=['POST'])
 @login_required
-def splices_home():
-    return render_template('splices.html', tiers=SpliceTier.query.order_by(SpliceTier.min_splices).all())
-
-@app.route('/splices/add', methods=['POST'])
-@login_required
-def splices_add():
+def settings_tiers_add():
     min_s = int(request.form.get('min_splices','0') or 0)
     max_raw = request.form.get('max_splices','').strip()
     max_s = int(max_raw) if max_raw else None
     price = float(request.form.get('price_per_splice_usd','0') or 0)
     db.session.add(SpliceTier(min_splices=min_s, max_splices=max_s, price_per_splice_usd=price))
-    db.session.commit(); flash('Faixa salva.','success'); return redirect(url_for('splices_home'))
+    db.session.commit(); flash('Faixa salva.','success'); return redirect(url_for('settings_home'))
 
-@app.route('/splices/delete/<int:tid>')
+@app.route('/settings/tiers/delete/<int:tid>')
 @login_required
-def splices_del(tid):
+def settings_tiers_del(tid):
     obj = SpliceTier.query.get_or_404(tid); db.session.delete(obj); db.session.commit()
-    flash('Faixa removida.','success'); return redirect(url_for('splices_home'))
+    flash('Faixa removida.','success'); return redirect(url_for('settings_home'))
 
 # ---------- Maps ----------
 @app.route('/maps')
@@ -253,6 +248,7 @@ def maps_delete(mid):
 @login_required
 def manual_entry():
     maps = MapMaster.query.order_by(MapMaster.name).all()
+    types = DeviceType.query.order_by(DeviceType.name).all()
     if request.method == 'POST':
         from datetime import datetime as _dt
         map_name = request.form.get('map','').strip()
@@ -274,13 +270,35 @@ def manual_entry():
         flash('Lançamento salvo.','success')
         return redirect(url_for('manual_entry'))
     recent = Record.query.order_by(Record.id.desc()).limit(25).all()
-    return render_template('manual_entry.html', maps=maps, recent=recent)
+    return render_template('manual_entry.html', maps=maps, types=types, recent=recent)
 
 # ---------- Reports ----------
 @app.route('/reports')
 @login_required
 def reports():
-    rows = Record.query.all()
+    # Date filters via querystring (?start=YYYY-MM-DD&end=YYYY-MM-DD)
+    start_raw = request.args.get('start','').strip()
+    end_raw = request.args.get('end','').strip()
+
+    q = Record.query
+    start_dt = end_dt = None
+    if start_raw:
+        try:
+            start_dt = datetime.strptime(start_raw, '%Y-%m-%d')
+            q = q.filter(Record.created_date.isnot(None)).filter(Record.created_date >= start_dt)
+        except Exception:
+            flash('Data inicial inválida. Use YYYY-MM-DD.','error')
+    if end_raw:
+        try:
+            # fim do dia 23:59:59
+            end_dt = datetime.strptime(end_raw, '%Y-%m-%d')
+            end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+            q = q.filter(Record.created_date.isnot(None)).filter(Record.created_date <= end_dt)
+        except Exception:
+            flash('Data final inválida. Use YYYY-MM-DD.','error')
+
+    rows = q.all()
+
     from collections import defaultdict
     agg_map = defaultdict(lambda: {'rows':0,'splices':0,'total':0.0})
     agg_type = defaultdict(lambda: {'rows':0,'splices':0,'total':0.0})
@@ -288,7 +306,16 @@ def reports():
         m = r.map or '—'; t = r.type or '—'
         agg_map[m]['rows'] += 1; agg_map[m]['splices'] += int(r.splices or 0); agg_map[m]['total'] += float(r.total_usd or 0.0)
         agg_type[t]['rows'] += 1; agg_type[t]['splices'] += int(r.splices or 0); agg_type[t]['total'] += float(r.total_usd or 0.0)
-    return render_template('reports.html', map_rows=sorted(agg_map.items()), type_rows=sorted(agg_type.items()))
+    # Totais gerais do filtro
+    total_rows = len(rows)
+    total_splices = sum(int(r.splices or 0) for r in rows)
+    total_usd = sum(float(r.total_usd or 0.0) for r in rows)
+
+    return render_template('reports.html',
+                           map_rows=sorted(agg_map.items()),
+                           type_rows=sorted(agg_type.items()),
+                           start=start_raw, end=end_raw,
+                           total_rows=total_rows, total_splices=total_splices, total_usd=total_usd)
 
 if __name__=='__main__':
     app.run(host='0.0.0.0', port=8000, debug=True)

@@ -12,7 +12,13 @@
       </div>
       <div class="mb-2">
         <label class="form-label">Type</label>
-        <input class="form-control" name="type" placeholder="Ex.: ONT, CTO, DROP" required>
+        {% if types %}
+        <select class="form-select" name="type" required>
+          {% for t in types %}<option value="{{ t.name }}">{{ t.name }}</option>{% endfor %}
+        </select>
+        {% else %}
+        <div class="alert alert-warning mt-2">Cadastre tipos de dispositivo em <b>Configurações</b> antes de lançar.</div>
+        {% endif %}
       </div>
       <div class="mb-2">
         <label class="form-label">Device (nome)</label>
