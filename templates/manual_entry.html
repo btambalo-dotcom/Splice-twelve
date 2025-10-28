@@ -1,0 +1,66 @@
+{% extends 'base.html' %}{% block content %}
+<h3>Lançamentos</h3>
+<div class="row g-4">
+  <div class="col-lg-6">
+    <div class="card p-4">
+      <h5>Novo lançamento</h5>
+      <form method="post">
+        <div class="mb-2">
+          <label class="form-label">Map</label>
+          <select class="form-select" name="map">
+            {% for m in maps %}<option value="{{ m.name }}">{{ m.name }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Type</label>
+          <input class="form-control" name="type" placeholder="Ex.: splice, placement, test" required>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Device</label>
+          <input class="form-control" name="device" placeholder="Ex.: SCA10470007" required>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Splices</label>
+          <input class="form-control" type="number" min="0" name="splices" value="0" required>
+        </div>
+        <div class="form-check mb-2">
+          <input class="form-check-input" type="checkbox" name="placement" id="plc">
+          <label for="plc" class="form-check-label">Placement realizado</label>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Splicer</label>
+          <input class="form-control" name="splicer" placeholder="Seu nome">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Data (Created)</label>
+          <input class="form-control" type="date" name="created">
+        </div>
+        <button class="btn btn-primary">Salvar lançamento</button>
+      </form>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card p-4">
+      <h5>Últimos lançamentos</h5>
+      <div class="table-responsive" style="max-height:60vh">
+        <table class="table table-sm table-dark">
+          <thead><tr><th>Data</th><th>Map</th><th>Type</th><th>Device</th><th>Splices</th><th>Placement</th><th>Total</th></tr></thead>
+          <tbody>
+            {% for r in recent %}
+              <tr>
+                <td>{{ r.created_date.date() if r.created_date else '' }}</td>
+                <td>{{ r.map }}</td>
+                <td>{{ r.type }}</td>
+                <td>{{ r.device }}</td>
+                <td>{{ r.splices }}</td>
+                <td>{{ 'Sim' if r.placement else 'Não' }}</td>
+                <td>R$ {{ '%.2f'|format(r.total or 0) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

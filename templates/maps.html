@@ -1,0 +1,30 @@
+{% extends 'base.html' %}{% block content %}
+<h3>Mapas</h3>
+<div class="row g-4">
+  <div class="col-md-6">
+    <div class="card p-4">
+      <h5>Adicionar Map</h5>
+      <form method="post" action="{{ url_for('maps_add') }}" class="row g-2">
+        <div class="col-8"><input class="form-control" name="name" placeholder="Ex.: SCA1047E, Bowman, SC" required></div>
+        <div class="col-4"><button class="btn btn-primary w-100">Adicionar</button></div>
+      </form>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card p-4">
+      <h5>Lista de Mapas</h5>
+      <table class="table table-sm table-dark">
+        <thead><tr><th>Nome</th><th class="text-end">Ações</th></tr></thead>
+        <tbody>
+          {% for m in maps %}
+            <tr><td>{{ m.name }}</td>
+            <td class="text-end"><a class="btn btn-sm btn-danger" href="{{ url_for('maps_delete', mid=m.id) }}">Excluir</a></td></tr>
+          {% else %}
+            <tr><td colspan="2" class="text-secondary">Nenhum mapa cadastrado.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

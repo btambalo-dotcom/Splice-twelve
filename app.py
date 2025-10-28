@@ -41,6 +41,10 @@ class SpliceTier(db.Model):
     max_splices = db.Column(db.Integer, nullable=True)
     price_per_splice = db.Column(db.Float, default=0.0, nullable=False)
 
+class MapMaster(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), unique=True, nullable=False)
+
 class Record(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     sheet = db.Column(db.String(120))
@@ -48,6 +52,7 @@ class Record(db.Model):
     type = db.Column(db.String(120))
     splices = db.Column(db.Integer)
     device = db.Column(db.String(120))
+    placement = db.Column(db.Boolean, default=False)
     created_date = db.Column(db.DateTime, nullable=True)
     splicer = db.Column(db.String(120))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -61,6 +66,7 @@ def load_user(uid): return User.query.get(int(uid))
 with app.app_context():
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     db.create_all()
+    db.session.commit()
 
 ALLOWED={'xlsx'}
 REQUIRED = ['Type','Map','Splices','Device','Splicer','Created']
@@ -220,6 +226,56 @@ def reports():
         agg_map[m]['rows'] += 1; agg_map[m]['splices'] += int(r.splices or 0); agg_map[m]['total'] += float(r.total or 0.0)
         agg_type[t]['rows'] += 1; agg_type[t]['splices'] += int(r.splices or 0); agg_type[t]['total'] += float(r.total or 0.0)
     return render_template('reports.html', map_rows=sorted(agg_map.items()), type_rows=sorted(agg_type.items()))
+
+@app.route('/manual', methods=['GET','POST'])
+@login_required
+def manual_entry():
+    maps = MapMaster.query.order_by(MapMaster.name).all()
+    if request.method == 'POST':
+        from datetime import datetime as _dt
+        map_name = request.form.get('map','').strip()
+        type_name = request.form.get('type','').strip()
+        device = request.form.get('device','').strip()
+        splices = int(request.form.get('splices','0') or 0)
+        placement = True if request.form.get('placement') == 'on' else False
+        splicer = request.form.get('splicer','').strip()
+        created_raw = request.form.get('created','').strip()
+        created_date = _dt.strptime(created_raw, '%Y-%m-%d') if created_raw else None
+
+        import pandas as pd
+        df = pd.DataFrame([{'Type': type_name, 'Map': map_name, 'Splices': splices, 'Device': device, 'Splicer': splicer, 'Created': created_date, '__sheet__': 'manual'}])
+        df = apply_prices(df)
+        r = Record(sheet='manual', map=map_name, type=type_name, splices=splices, device=device,
+                   placement=placement, created_date=created_date, splicer=splicer,
+                   price_splices=float(df.iloc[0]['price_splices']), price_device=float(df.iloc[0]['price_device']),
+                   total=float(df.iloc[0]['total']))
+        db.session.add(r); db.session.commit()
+        flash('Lançamento salvo.','success')
+        return redirect(url_for('manual_entry'))
+    recent = Record.query.order_by(Record.id.desc()).limit(25).all()
+    return render_template('manual_entry.html', maps=maps, recent=recent)
+
+@app.route('/maps')
+@login_required
+def maps_home():
+    return render_template('maps.html', maps=MapMaster.query.order_by(MapMaster.name).all())
+
+@app.route('/maps/add', methods=['POST'])
+@login_required
+def maps_add():
+    name = request.form.get('name','').strip()
+    if name and not MapMaster.query.filter_by(name=name).first():
+        db.session.add(MapMaster(name=name)); db.session.commit(); flash('Mapa adicionado.','success')
+    else:
+        flash('Nome vazio ou já existe.','error')
+    return redirect(url_for('maps_home'))
+
+@app.route('/maps/delete/<int:mid>')
+@login_required
+def maps_delete(mid):
+    m = MapMaster.query.get_or_404(mid); db.session.delete(m); db.session.commit()
+    flash('Mapa removido.','success')
+    return redirect(url_for('maps_home'))
 
 if __name__=='__main__':
     app.run(host='0.0.0.0', port=8000, debug=True)
