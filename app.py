@@ -11,11 +11,10 @@ from io import BytesIO
 BASE_DIR = Path(__file__).parent.resolve()
 EXPORT_DIR = BASE_DIR / 'exports'
 EXPORT_DIR.mkdir(exist_ok=True)
-SQLITE_PATH = Path('/tmp/app.db')
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY','dev-key')
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{SQLITE_PATH}'
+app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{(BASE_DIR / 'data.db').as_posix()}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
@@ -33,13 +32,13 @@ class User(UserMixin, db.Model):
 class DeviceType(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(120), unique=True, nullable=False)
-    value = db.Column(db.Float, default=0.0, nullable=False)
+    value_usd = db.Column(db.Float, default=0.0, nullable=False)
 
 class SpliceTier(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     min_splices = db.Column(db.Integer, nullable=False)
     max_splices = db.Column(db.Integer, nullable=True)
-    price_per_splice = db.Column(db.Float, default=0.0, nullable=False)
+    price_per_splice_usd = db.Column(db.Float, default=0.0, nullable=False)
 
 class MapMaster(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -52,32 +51,29 @@ class Record(db.Model):
     type = db.Column(db.String(120))
     splices = db.Column(db.Integer)
     device = db.Column(db.String(120))
-    placement = db.Column(db.Boolean, default=False)
     created_date = db.Column(db.DateTime, nullable=True)
     splicer = db.Column(db.String(120))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    price_splices = db.Column(db.Float, default=0.0)
-    price_device = db.Column(db.Float, default=0.0)
-    total = db.Column(db.Float, default=0.0)
+    price_splices_usd = db.Column(db.Float, default=0.0)
+    price_device_usd = db.Column(db.Float, default=0.0)
+    total_usd = db.Column(db.Float, default=0.0)
 
 @login_manager.user_loader
 def load_user(uid): return User.query.get(int(uid))
 
 with app.app_context():
-    SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     db.create_all()
-    db.session.commit()
 
+# ---------- Helpers ----------
 ALLOWED={'xlsx'}
 REQUIRED = ['Type','Map','Splices','Device','Splicer','Created']
 
-def parse_excel_exact(upload):
+def parse_excel(upload):
     raw = upload.read()
     xls = pd.ExcelFile(BytesIO(raw))
-    sheet = 'Sheet1'
-    if sheet not in xls.sheet_names:
+    if 'Sheet1' not in xls.sheet_names:
         raise ValueError('A aba "Sheet1" não foi encontrada')
-    df = xls.parse(sheet)
+    df = xls.parse('Sheet1')
     df.columns = [str(c).strip() for c in df.columns]
     missing = [c for c in REQUIRED if c not in df.columns]
     if missing:
@@ -85,21 +81,27 @@ def parse_excel_exact(upload):
     out = df[REQUIRED].copy()
     out['Splices'] = pd.to_numeric(out['Splices'], errors='coerce').fillna(0).astype(int)
     out['Created'] = pd.to_datetime(out['Created'], errors='coerce')
-    out['__sheet__'] = sheet
+    out['__sheet__'] = 'Sheet1'
     return out
 
-def price_for_splices(n):
-    tier = SpliceTier.query.filter((SpliceTier.min_splices <= n) & ((SpliceTier.max_splices >= n) | (SpliceTier.max_splices.is_(None)))).order_by(SpliceTier.min_splices.desc()).first()
-    return (n * tier.price_per_splice) if tier else 0.0
-def price_for_device_type(type_name):
+def tier_price_for(count):
+    # count is the chargeable splices (after discounting the first one)
+    tier = SpliceTier.query.filter((SpliceTier.min_splices <= count) & ((SpliceTier.max_splices >= count) | (SpliceTier.max_splices.is_(None)))).order_by(SpliceTier.min_splices.desc()).first()
+    return tier.price_per_splice_usd if tier else 0.0
+
+def device_value_for(type_name):
     if not type_name: return 0.0
     dt = DeviceType.query.filter(DeviceType.name.ilike(str(type_name))).first()
-    return dt.value if dt else 0.0
+    return dt.value_usd if dt else 0.0
 
 def apply_prices(df):
-    df['price_splices'] = df['Splices'].apply(lambda n: price_for_splices(int(n)))
-    df['price_device'] = df['Type'].astype(str).apply(lambda t: price_for_device_type(str(t)))
-    df['total'] = df['price_splices'] + df['price_device']
+    def row_calc(splices, type_name):
+        charge = max(int(splices) - 1, 0)
+        return charge * tier_price_for(charge), device_value_for(type_name)
+    prices = df.apply(lambda r: row_calc(r['Splices'], str(r['Type'])), axis=1, result_type='expand')
+    df['price_splices_usd'] = prices[0]
+    df['price_device_usd'] = prices[1]
+    df['total_usd'] = (df['price_splices_usd'] + df['price_device_usd']).round(2)
     return df
 
 def persist(df):
@@ -109,11 +111,12 @@ def persist(df):
                            splices=int(r.get('Splices') or 0), device=str(r.get('Device') or ''),
                            created_date=r.get('Created') if pd.notna(r.get('Created')) else None,
                            splicer=str(r.get('Splicer') or ''),
-                           price_splices=float(r.get('price_splices') or 0.0), price_device=float(r.get('price_device') or 0.0),
-                           total=float(r.get('total') or 0.0)))
+                           price_splices_usd=float(r.get('price_splices_usd') or 0.0), price_device_usd=float(r.get('price_device_usd') or 0.0),
+                           total_usd=float(r.get('total_usd') or 0.0)))
     if rows:
         db.session.bulk_save_objects(rows); db.session.commit()
 
+# ---------- Auth ----------
 @app.route('/init-admin')
 def init_admin():
     user = os.environ.get('ADMIN_USERNAME','admin'); pwd = os.environ.get('ADMIN_PASSWORD','admin123')
@@ -121,8 +124,6 @@ def init_admin():
         u=User(username=user, is_admin=True); u.set_password(pwd); db.session.add(u); db.session.commit()
         return f'Admin criado: {user} / {pwd}'
     return 'Admin já existe.'
-
-from flask import render_template_string
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -137,6 +138,7 @@ def login():
 @login_required
 def logout(): logout_user(); return redirect(url_for('login'))
 
+# ---------- Upload / Dashboard ----------
 @app.route('/', methods=['GET','POST'])
 @login_required
 def index():
@@ -148,19 +150,21 @@ def index():
         if ext not in ALLOWED:
             flash('Somente .xlsx é permitido','error'); return redirect(url_for('index'))
         try:
-            df = parse_excel_exact(f)
+            df = parse_excel(f)
             df = apply_prices(df)
             persist(df)
         except Exception as e:
             flash(f'Erro ao ler planilha: {e}','error'); return redirect(url_for('index'))
         token = uuid.uuid4().hex
-        (EXPORT_DIR/f'clean_{token}.csv').write_text(df.to_csv(index=False), encoding='utf-8')
-        with pd.ExcelWriter(EXPORT_DIR/f'clean_{token}.xlsx', engine='openpyxl') as w:
+        csv_path = EXPORT_DIR / f'clean_{token}.csv'
+        xlsx_path = EXPORT_DIR / f'clean_{token}.xlsx'
+        df.to_csv(csv_path, index=False)
+        with pd.ExcelWriter(xlsx_path, engine='openpyxl') as w:
             df.to_excel(w, index=False, sheet_name='dados')
         table_html = df.head(100).to_html(index=False, classes='table table-striped table-sm')
         return render_template('results.html', table_html=table_html, token=token)
     from sqlalchemy import func
-    totals = db.session.query(func.count(Record.id), func.sum(Record.total)).first()
+    totals = db.session.query(func.count(Record.id), func.sum(Record.total_usd)).first()
     return render_template('upload.html', total_rows=totals[0] or 0, total_amount=totals[1] or 0.0)
 
 @app.route('/download/csv/<token>')
@@ -175,86 +179,53 @@ def download_xlsx(token):
     path = EXPORT_DIR / f'clean_{token}.xlsx'
     return send_file(path, as_attachment=True, download_name='dados_limpos.xlsx')
 
-@app.route('/settings')
+# ---------- Devices ----------
+@app.route('/devices')
 @login_required
-def settings_home():
-    return render_template('settings.html',
-        types=DeviceType.query.order_by(DeviceType.name).all(),
-        tiers=SpliceTier.query.order_by(SpliceTier.min_splices).all())
+def devices_home():
+    return render_template('devices.html', types=DeviceType.query.order_by(DeviceType.name).all())
 
-@app.route('/settings/device-type', methods=['POST'])
+@app.route('/devices/add', methods=['POST'])
 @login_required
-def add_device_type():
+def devices_add():
     name = request.form.get('name','').strip()
-    value = float(request.form.get('value','0') or 0)
+    val = float(request.form.get('value_usd','0') or 0)
+    if not name:
+        flash('Nome obrigatório.','error'); return redirect(url_for('devices_home'))
     obj = DeviceType.query.filter(DeviceType.name.ilike(name)).first()
-    if obj: obj.value = value
-    else: db.session.add(DeviceType(name=name, value=value))
-    db.session.commit(); flash('Tipo salvo.','success'); return redirect(url_for('settings_home'))
+    if obj: obj.value_usd = val
+    else: db.session.add(DeviceType(name=name, value_usd=val))
+    db.session.commit(); flash('Salvo.','success'); return redirect(url_for('devices_home'))
 
-@app.route('/settings/device-type/delete/<int:tid>')
+@app.route('/devices/delete/<int:tid>')
 @login_required
-def del_device_type(tid):
+def devices_del(tid):
     obj = DeviceType.query.get_or_404(tid); db.session.delete(obj); db.session.commit()
-    flash('Tipo removido.','success'); return redirect(url_for('settings_home'))
+    flash('Removido.','success'); return redirect(url_for('devices_home'))
 
-@app.route('/settings/splice-tier', methods=['POST'])
+# ---------- Splice tiers ----------
+@app.route('/splices')
 @login_required
-def add_splice_tier():
+def splices_home():
+    return render_template('splices.html', tiers=SpliceTier.query.order_by(SpliceTier.min_splices).all())
+
+@app.route('/splices/add', methods=['POST'])
+@login_required
+def splices_add():
     min_s = int(request.form.get('min_splices','0') or 0)
     max_raw = request.form.get('max_splices','').strip()
     max_s = int(max_raw) if max_raw else None
-    price = float(request.form.get('price_per_splice','0') or 0)
-    db.session.add(SpliceTier(min_splices=min_s, max_splices=max_s, price_per_splice=price))
-    db.session.commit(); flash('Faixa salva.','success'); return redirect(url_for('settings_home'))
+    price = float(request.form.get('price_per_splice_usd','0') or 0)
+    db.session.add(SpliceTier(min_splices=min_s, max_splices=max_s, price_per_splice_usd=price))
+    db.session.commit(); flash('Faixa salva.','success'); return redirect(url_for('splices_home'))
 
-@app.route('/settings/splice-tier/delete/<int:tid>')
+@app.route('/splices/delete/<int:tid>')
 @login_required
-def del_splice_tier(tid):
+def splices_del(tid):
     obj = SpliceTier.query.get_or_404(tid); db.session.delete(obj); db.session.commit()
-    flash('Faixa removida.','success'); return redirect(url_for('settings_home'))
+    flash('Faixa removida.','success'); return redirect(url_for('splices_home'))
 
-@app.route('/reports')
-@login_required
-def reports():
-    rows = Record.query.all()
-    from collections import defaultdict
-    agg_map = defaultdict(lambda: {'rows':0,'splices':0,'total':0.0})
-    agg_type = defaultdict(lambda: {'rows':0,'splices':0,'total':0.0})
-    for r in rows:
-        m = r.map or '—'; t = r.type or '—'
-        agg_map[m]['rows'] += 1; agg_map[m]['splices'] += int(r.splices or 0); agg_map[m]['total'] += float(r.total or 0.0)
-        agg_type[t]['rows'] += 1; agg_type[t]['splices'] += int(r.splices or 0); agg_type[t]['total'] += float(r.total or 0.0)
-    return render_template('reports.html', map_rows=sorted(agg_map.items()), type_rows=sorted(agg_type.items()))
-
-@app.route('/manual', methods=['GET','POST'])
-@login_required
-def manual_entry():
-    maps = MapMaster.query.order_by(MapMaster.name).all()
-    if request.method == 'POST':
-        from datetime import datetime as _dt
-        map_name = request.form.get('map','').strip()
-        type_name = request.form.get('type','').strip()
-        device = request.form.get('device','').strip()
-        splices = int(request.form.get('splices','0') or 0)
-        placement = True if request.form.get('placement') == 'on' else False
-        splicer = request.form.get('splicer','').strip()
-        created_raw = request.form.get('created','').strip()
-        created_date = _dt.strptime(created_raw, '%Y-%m-%d') if created_raw else None
-
-        import pandas as pd
-        df = pd.DataFrame([{'Type': type_name, 'Map': map_name, 'Splices': splices, 'Device': device, 'Splicer': splicer, 'Created': created_date, '__sheet__': 'manual'}])
-        df = apply_prices(df)
-        r = Record(sheet='manual', map=map_name, type=type_name, splices=splices, device=device,
-                   placement=placement, created_date=created_date, splicer=splicer,
-                   price_splices=float(df.iloc[0]['price_splices']), price_device=float(df.iloc[0]['price_device']),
-                   total=float(df.iloc[0]['total']))
-        db.session.add(r); db.session.commit()
-        flash('Lançamento salvo.','success')
-        return redirect(url_for('manual_entry'))
-    recent = Record.query.order_by(Record.id.desc()).limit(25).all()
-    return render_template('manual_entry.html', maps=maps, recent=recent)
-
+# ---------- Maps ----------
 @app.route('/maps')
 @login_required
 def maps_home():
@@ -276,6 +247,48 @@ def maps_delete(mid):
     m = MapMaster.query.get_or_404(mid); db.session.delete(m); db.session.commit()
     flash('Mapa removido.','success')
     return redirect(url_for('maps_home'))
+
+# ---------- Manual Entry ----------
+@app.route('/manual', methods=['GET','POST'])
+@login_required
+def manual_entry():
+    maps = MapMaster.query.order_by(MapMaster.name).all()
+    if request.method == 'POST':
+        from datetime import datetime as _dt
+        map_name = request.form.get('map','').strip()
+        type_name = request.form.get('type','').strip()
+        device = request.form.get('device','').strip()
+        splices = int(request.form.get('splices','0') or 0)
+        splicer = request.form.get('splicer','').strip()
+        created_raw = request.form.get('created','').strip()
+        created_date = _dt.strptime(created_raw, '%Y-%m-%d') if created_raw else None
+
+        import pandas as pd
+        df = pd.DataFrame([{'Type': type_name, 'Map': map_name, 'Splices': splices, 'Device': device, 'Splicer': splicer, 'Created': created_date, '__sheet__': 'manual'}])
+        df = apply_prices(df)
+        r = Record(sheet='manual', map=map_name, type=type_name, splices=splices, device=device,
+                   created_date=created_date, splicer=splicer,
+                   price_splices_usd=float(df.iloc[0]['price_splices_usd']), price_device_usd=float(df.iloc[0]['price_device_usd']),
+                   total_usd=float(df.iloc[0]['total_usd']))
+        db.session.add(r); db.session.commit()
+        flash('Lançamento salvo.','success')
+        return redirect(url_for('manual_entry'))
+    recent = Record.query.order_by(Record.id.desc()).limit(25).all()
+    return render_template('manual_entry.html', maps=maps, recent=recent)
+
+# ---------- Reports ----------
+@app.route('/reports')
+@login_required
+def reports():
+    rows = Record.query.all()
+    from collections import defaultdict
+    agg_map = defaultdict(lambda: {'rows':0,'splices':0,'total':0.0})
+    agg_type = defaultdict(lambda: {'rows':0,'splices':0,'total':0.0})
+    for r in rows:
+        m = r.map or '—'; t = r.type or '—'
+        agg_map[m]['rows'] += 1; agg_map[m]['splices'] += int(r.splices or 0); agg_map[m]['total'] += float(r.total_usd or 0.0)
+        agg_type[t]['rows'] += 1; agg_type[t]['splices'] += int(r.splices or 0); agg_type[t]['total'] += float(r.total_usd or 0.0)
+    return render_template('reports.html', map_rows=sorted(agg_map.items()), type_rows=sorted(agg_type.items()))
 
 if __name__=='__main__':
     app.run(host='0.0.0.0', port=8000, debug=True)

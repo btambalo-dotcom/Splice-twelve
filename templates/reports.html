@@ -1,21 +1,21 @@
 {% extends 'base.html' %}{% block content %}
 <h3>Relatórios</h3>
 <div class="row g-4">
-  <div class="col-md-6"><div class="card p-3 bg-secondary-subtle text-dark">
+  <div class="col-md-6"><div class="card p-3">
     <h5>Por MAP</h5>
-    <table class="table table-sm"><thead><tr><th>Map</th><th>Linhas</th><th>Fusões</th><th>Total</th></tr></thead>
+    <table class="table table-sm table-dark"><thead><tr><th>Map</th><th>Linhas</th><th>Fusões</th><th>Total ($)</th></tr></thead>
       <tbody>
       {% for k,v in map_rows %}
-        <tr><td>{{ k }}</td><td>{{ v.rows }}</td><td>{{ v.splices }}</td><td>R$ {{ '%.2f'|format(v.total) }}</td></tr>
+        <tr><td>{{ k }}</td><td>{{ v.rows }}</td><td>{{ v.splices }}</td><td>$ {{ '%.2f'|format(v.total) }}</td></tr>
       {% endfor %}
       </tbody></table>
   </div></div>
-  <div class="col-md-6"><div class="card p-3 bg-secondary-subtle text-dark">
+  <div class="col-md-6"><div class="card p-3">
     <h5>Por TYPE</h5>
-    <table class="table table-sm"><thead><tr><th>Type</th><th>Linhas</th><th>Fusões</th><th>Total</th></tr></thead>
+    <table class="table table-sm table-dark"><thead><tr><th>Type</th><th>Linhas</th><th>Fusões</th><th>Total ($)</th></tr></thead>
       <tbody>
       {% for k,v in type_rows %}
-        <tr><td>{{ k }}</td><td>{{ v.rows }}</td><td>{{ v.splices }}</td><td>R$ {{ '%.2f'|format(v.total) }}</td></tr>
+        <tr><td>{{ k }}</td><td>{{ v.rows }}</td><td>{{ v.splices }}</td><td>$ {{ '%.2f'|format(v.total) }}</td></tr>
       {% endfor %}
       </tbody></table>
   </div></div>

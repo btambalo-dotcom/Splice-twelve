@@ -1,24 +1,23 @@
 {% extends 'base.html' %}{% block content %}
 <div class="kpi mb-4">
   <div class="box"><span>Registros no banco</span><h2>{{ total_rows }}</h2></div>
-  <div class="box"><span>Valor total acumulado</span><h2>R$ {{ '%.2f'|format(total_amount or 0) }}</h2></div>
+  <div class="box"><span>Valor total acumulado</span><h2>$ {{ '%.2f'|format(total_amount or 0) }}</h2></div>
   <div class="box"><span>Formato aceito</span><h2>.xlsx</h2></div>
 </div>
 <div class="row g-4">
   <div class="col-lg-7"><div class="card p-4 alt">
     <h4>Leitor Twelve Tech (.xlsx)</h4>
-    <p class="text-secondary">Envie apenas <b>.xlsx</b> (aba <b>Sheet1</b>) com colunas: <code>Type, Map, Splices, Device, Splicer, Created</code>.</p>
+    <p class="text-secondary">Aba <b>Sheet1</b>, colunas: <code>Type, Map, Splices, Device, Splicer, Created</code>.</p>
     <form method="post" enctype="multipart/form-data">
-      <input class="form-control mb-3" type="file" name="file" accept=".xlsx" required>
+      <input class="form-control mb-3" type="file" name="file" accept=".xlsx">
       <button class="btn btn-primary">Enviar e Processar</button>
     </form>
   </div></div>
   <div class="col-lg-5"><div class="card p-4">
     <h5>Dicas</h5>
     <ul class="text-secondary mb-0">
-      <li>A aba deve se chamar <b>Sheet1</b>.</li>
-      <li>Nomes das colunas precisam ser idênticos.</li>
       <li>Datas são convertidas automaticamente.</li>
+      <li>Primeira fusão é desconsiderada no cálculo.</li>
     </ul>
   </div></div>
 </div>
