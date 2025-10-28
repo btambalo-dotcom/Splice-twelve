@@ -5,7 +5,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 from datetime import datetime
 from collections import defaultdict
-import os, re, uuid
+import os, re, uuid, io
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.resolve()
@@ -62,7 +62,7 @@ with app.app_context():
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     db.create_all()
 
-# ---------- Helpers ----------
+# ---------- Parsing helpers ----------
 ALLOWED={'xlsx','xls','csv'}
 def allowed_file(n): return '.' in n and n.rsplit('.',1)[1].lower() in ALLOWED
 
@@ -87,18 +87,15 @@ def make_unique(cols):
 HEADER_ALIASES = {
     'type': {'type','tipo','category','classe'},
     'map': {'map','mapa','map name','nome do mapa'},
-    'splices': {'splices','splice','fusoes','fusao','fusões','fusão','qtd fusoes','splice count','splice qty'},
+    'splices': {'splices','splice','fusoes','fusao','fusões','fusão','qtd fusoes','splice count','splice qty','qty'},
     'device': {'device','dispositivo','equipamento','serial'},
     'created_date': {'created','created_at','data','date','created date'},
     'splicer': {'splicer','tecnico','técnico','technician'}
 }
 
 def sanitize_columns(df):
-    # strip quotes/whitespace
     df.columns = [str(c).strip().strip('"').strip("'") for c in df.columns]
-    # drop exact duplicates (keeps first)
     df = df.loc[:, ~pd.Index(df.columns).duplicated()]
-    # ensure uniqueness
     df.columns = make_unique(df.columns)
     return df
 
@@ -153,50 +150,62 @@ def guess_missing(df):
         if best: df.rename(columns={best:'map'}, inplace=True)
     return df
 
+REQUIRED = ['type','map','splices','device','created_date','splicer']
+
+def ensure_required(df):
+    for c in REQUIRED:
+        if c not in df.columns:
+            df[c] = None if c!='splices' else 0
+    df['splices'] = pd.to_numeric(df['splices'], errors='coerce').fillna(0).astype(int)
+    return df
+
 def finalize(df, sheet_name):
     if hasattr(df.columns, 'levels'):
         df.columns = [' '.join([str(x) for x in t if str(x)!='']) for t in df.columns]
     df = sanitize_columns(df)
     df = rename_headers(df)
     df = guess_missing(df)
-    wanted = ['type','map','splices','device','created_date','splicer']
-    # Keep only known/wanted columns to avoid reindex error paths
-    keep = [c for c in df.columns if c in wanted]
-    df = df[keep] if keep else pd.DataFrame(columns=wanted)
-    out = df.copy()
-    if 'splices' not in out.columns: out['splices'] = 0
-    if 'type' not in out.columns: out['type'] = None
-    if 'map' not in out.columns: out['map'] = None
-    if 'device' not in out.columns: out['device'] = None
-    if 'created_date' in out.columns: out['created_date'] = pd.to_datetime(out['created_date'], errors='coerce')
-    out['splices'] = pd.to_numeric(out['splices'], errors='coerce').fillna(0).astype(int)
-    out['__sheet__'] = sheet_name
-    return out[['type','map','splices','device','created_date','splicer','__sheet__']]
+    df = ensure_required(df)
+    df['__sheet__'] = sheet_name
+    return df[REQUIRED + ['__sheet__']]
+
+def try_read_csv(upload):
+    # Try multiple separators; handle BOM
+    raw = upload.read()
+    # reset stream for potential Excel read later
+    from io import BytesIO
+    b = BytesIO(raw)
+    for sep in [None, ',', ';', '	']:
+        try:
+            b.seek(0)
+            df = pd.read_csv(b, sep=sep, engine='python', quotechar='"', skipinitialspace=True)
+            return finalize(df, 'CSV')
+        except Exception:
+            continue
+    raise ValueError('CSV inválido')
 
 def read_table(upload):
     ext = upload.filename.rsplit('.',1)[1].lower()
     if ext=='csv':
-        df = pd.read_csv(upload, sep=None, engine='python', quotechar='"', skipinitialspace=True)
-        return finalize(df, 'CSV')
-    xl = pd.ExcelFile(upload)
-    frames = [finalize(xl.parse(n), n) for n in xl.sheet_names]
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=['type','map','splices','device','created_date','splicer','__sheet__'])
+        return try_read_csv(upload)
+    # Excel
+    return finalize(pd.concat([pd.read_excel(upload, sheet_name=None)[s] for s in pd.read_excel(upload, sheet_name=None)], ignore_index=True), 'EXCEL')
 
 # ---------- Pricing ----------
-class PricingMixin:
-    @staticmethod
-    def price_for_splices(n):
-        tier = SpliceTier.query.filter((SpliceTier.min_splices <= n) & ((SpliceTier.max_splices >= n) | (SpliceTier.max_splices.is_(None)))).order_by(SpliceTier.min_splices.desc()).first()
-        return (n * tier.price_per_splice) if tier else 0.0
-    @staticmethod
-    def price_for_device_type(type_name):
-        if not type_name: return 0.0
-        dt = DeviceType.query.filter(DeviceType.name.ilike(str(type_name))).first()
-        return dt.value if dt else 0.0
+def price_for_splices(n):
+    tier = SpliceTier.query.filter((SpliceTier.min_splices <= n) & ((SpliceTier.max_splices >= n) | (SpliceTier.max_splices.is_(None)))).order_by(SpliceTier.min_splices.desc()).first()
+    return (n * tier.price_per_splice) if tier else 0.0
+def price_for_device_type(type_name):
+    if not type_name: return 0.0
+    dt = DeviceType.query.filter(DeviceType.name.ilike(str(type_name))).first()
+    return dt.value if dt else 0.0
 
 def apply_prices(df):
-    df['price_splices'] = df['splices'].apply(lambda n: PricingMixin.price_for_splices(int(n) if pd.notna(n) else 0))
-    df['price_device'] = df['type'].apply(lambda t: PricingMixin.price_for_device_type(str(t)) if pd.notna(t) else 0.0)
+    # Safe even if columns empty
+    splices_series = pd.to_numeric(df.get('splices', 0), errors='coerce').fillna(0).astype(int)
+    types_series = df.get('type', '').astype(str)
+    df['price_splices'] = splices_series.apply(lambda n: price_for_splices(int(n)))
+    df['price_device'] = types_series.apply(lambda t: price_for_device_type(str(t)))
     df['total'] = df['price_splices'] + df['price_device']
     return df
 
@@ -243,9 +252,10 @@ def index():
         if not allowed_file(f.filename): flash('Formato não suportado.','error'); return redirect(request.url)
         try:
             df = read_table(f)
+            df = apply_prices(df)
+            persist(df)
         except Exception as e:
             flash(f'Erro ao ler arquivo: {e}','error'); return redirect(request.url)
-        df = apply_prices(df); persist(df)
 
         token = uuid.uuid4().hex
         csv_path = EXPORT_DIR / f'clean_{token}.csv'
