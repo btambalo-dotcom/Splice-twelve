@@ -8,12 +8,13 @@
   <div class="container">
     <a class="navbar-brand brand" href="{{ url_for('index') }}">
       <img src="{{ url_for('static', filename='img/logo.png') }}" alt="logo"/>
-      Twelve Tech <span class="badge-chip">USD</span>
+      Twelve Tech <span class="badge bg-info ms-2">USD</span>
     </a>
     <div class="ms-auto">
       {% if current_user.is_authenticated %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('reports') }}">Relatórios</a>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('manual_entry') }}">Lançamentos</a>
+        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('records_home') }}">Registros</a>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('settings_home') }}">Configurações</a>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('maps_home') }}">Mapas</a>
         <a class="btn btn-sm btn-danger" href="{{ url_for('logout') }}">Sair</a>

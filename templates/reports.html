@@ -13,6 +13,8 @@
   <div class="col-sm-6">
     <button class="btn btn-primary me-2">Filtrar</button>
     <a class="btn btn-outline-light" href="{{ url_for('reports') }}">Limpar</a>
+    <a class="btn btn-success ms-2" href="{{ url_for('export_report_xlsx', start=start, end=end) }}">Exportar Excel</a>
+    <a class="btn btn-success ms-2" href="{{ url_for('export_report_pdf', start=start, end=end) }}">Exportar PDF</a>
   </div>
 </form>
 

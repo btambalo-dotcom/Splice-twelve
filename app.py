@@ -85,7 +85,8 @@ def parse_excel(upload):
     return out
 
 def tier_price_for(count):
-    tier = SpliceTier.query.filter((SpliceTier.min_splices <= count) & ((SpliceTier.max_splices >= count) | (SpliceTier.max_splices.is_(None)))).order_by(SpliceTier.min_splices.desc()).first()
+    from sqlalchemy import or_
+    tier = SpliceTier.query.filter((SpliceTier.min_splices <= count) & (or_(SpliceTier.max_splices == None, SpliceTier.max_splices >= count))).order_by(SpliceTier.min_splices.desc()).first()
     return tier.price_per_splice_usd if tier else 0.0
 
 def device_value_for(type_name):
@@ -95,7 +96,7 @@ def device_value_for(type_name):
 
 def apply_prices(df):
     def row_calc(splices, type_name):
-        charge = max(int(splices) - 1, 0)
+        charge = max(int(splices) - 1, 0)  # desconsidera a 1ª fusão
         return charge * tier_price_for(charge), device_value_for(type_name)
     prices = df.apply(lambda r: row_calc(r['Splices'], str(r['Type'])), axis=1, result_type='expand')
     df['price_splices_usd'] = prices[0]
@@ -272,6 +273,42 @@ def manual_entry():
     recent = Record.query.order_by(Record.id.desc()).limit(25).all()
     return render_template('manual_entry.html', maps=maps, types=types, recent=recent)
 
+# ---------- Records Management ----------
+@app.route('/records')
+@login_required
+def records_home():
+    start_raw = request.args.get('start','').strip()
+    end_raw = request.args.get('end','').strip()
+    map_q = request.args.get('map','').strip()
+    type_q = request.args.get('type','').strip()
+    device_q = request.args.get('device','').strip()
+
+    q = Record.query
+    if start_raw:
+        try:
+            sdt = datetime.strptime(start_raw, '%Y-%m-%d')
+            q = q.filter(Record.created_date.isnot(None)).filter(Record.created_date >= sdt)
+        except: flash('Data inicial inválida.','error')
+    if end_raw:
+        try:
+            edt = datetime.strptime(end_raw, '%Y-%m-%d').replace(hour=23,minute=59,second=59,microsecond=999999)
+            q = q.filter(Record.created_date.isnot(None)).filter(Record.created_date <= edt)
+        except: flash('Data final inválida.','error')
+    if map_q: q = q.filter(Record.map.ilike(f"%{map_q}%"))
+    if type_q: q = q.filter(Record.type.ilike(f"%{type_q}%"))
+    if device_q: q = q.filter(Record.device.ilike(f"%{device_q}%"))
+    rows = q.order_by(Record.id.desc()).limit(300).all()
+    return render_template('records.html', rows=rows, start=start_raw, end=end_raw, map=map_q, type=type_q, device=device_q)
+
+@app.route('/record/delete/<int:rid>')
+@login_required
+def record_delete(rid):
+    obj = Record.query.get_or_404(rid)
+    db.session.delete(obj); db.session.commit()
+    where = request.args.get('next','') or 'manual'
+    flash('Registro removido.','success')
+    return redirect(url_for('manual_entry') if where=='manual' else url_for('records_home'))
+
 # ---------- Reports ----------
 @app.route('/reports')
 @login_required
@@ -290,7 +327,6 @@ def reports():
             flash('Data inicial inválida. Use YYYY-MM-DD.','error')
     if end_raw:
         try:
-            # fim do dia 23:59:59
             end_dt = datetime.strptime(end_raw, '%Y-%m-%d')
             end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
             q = q.filter(Record.created_date.isnot(None)).filter(Record.created_date <= end_dt)
@@ -306,7 +342,6 @@ def reports():
         m = r.map or '—'; t = r.type or '—'
         agg_map[m]['rows'] += 1; agg_map[m]['splices'] += int(r.splices or 0); agg_map[m]['total'] += float(r.total_usd or 0.0)
         agg_type[t]['rows'] += 1; agg_type[t]['splices'] += int(r.splices or 0); agg_type[t]['total'] += float(r.total_usd or 0.0)
-    # Totais gerais do filtro
     total_rows = len(rows)
     total_splices = sum(int(r.splices or 0) for r in rows)
     total_usd = sum(float(r.total_usd or 0.0) for r in rows)
@@ -316,6 +351,114 @@ def reports():
                            type_rows=sorted(agg_type.items()),
                            start=start_raw, end=end_raw,
                            total_rows=total_rows, total_splices=total_splices, total_usd=total_usd)
+
+# ---------- Report Exports ----------
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+def _filtered_rows_for_report(args):
+    start_raw = (args.get('start') or '').strip()
+    end_raw = (args.get('end') or '').strip()
+    q = Record.query
+    if start_raw:
+        try:
+            sdt = datetime.strptime(start_raw, '%Y-%m-%d')
+            q = q.filter(Record.created_date.isnot(None)).filter(Record.created_date >= sdt)
+        except: pass
+    if end_raw:
+        try:
+            edt = datetime.strptime(end_raw, '%Y-%m-%d').replace(hour=23,minute=59,second=59,microsecond=999999)
+            q = q.filter(Record.created_date.isnot(None)).filter(Record.created_date <= edt)
+        except: pass
+    return q.all(), start_raw, end_raw
+
+@app.route('/export/report/xlsx')
+@login_required
+def export_report_xlsx():
+    rows, start_raw, end_raw = _filtered_rows_for_report(request.args)
+    import pandas as pd
+    raw = [{
+        'ID': r.id, 'Created': r.created_date, 'Map': r.map, 'Type': r.type, 'Device': r.device, 'Splices': r.splices,
+        'Price Splices ($)': r.price_splices_usd, 'Price Device ($)': r.price_device_usd, 'Total ($)': r.total_usd
+    } for r in rows]
+    df = pd.DataFrame(raw)
+
+    # Aggregations
+    map_agg = df.groupby('Map', dropna=False).agg({'ID':'count','Splices':'sum','Total ($)':'sum'}).reset_index().rename(columns={'ID':'Linhas'}) if not df.empty else pd.DataFrame(columns=['Map','Linhas','Splices','Total ($)'])
+    type_agg = df.groupby('Type', dropna=False).agg({'ID':'count','Splices':'sum','Total ($)':'sum'}).reset_index().rename(columns={'ID':'Linhas'}) if not df.empty else pd.DataFrame(columns=['Type','Linhas','Splices','Total ($)'])
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as w:
+        kpi = pd.DataFrame({'Métrica':['Linhas','Fusões','Total ($)'],
+                            'Valor':[int(df.shape[0]), int(df['Splices'].sum()) if not df.empty else 0, float(df['Total ($)'].sum()) if not df.empty else 0.0]})
+        kpi.to_excel(w, index=False, sheet_name='KPIs')
+        map_agg.to_excel(w, index=False, sheet_name='Por MAP')
+        type_agg.to_excel(w, index=False, sheet_name='Por TYPE')
+        df.to_excel(w, index=False, sheet_name='Registros')
+    buf.seek(0)
+    name = f"relatorio_{start_raw or 'inicio'}_{end_raw or 'fim'}.xlsx"
+    return send_file(buf, as_attachment=True, download_name=name)
+
+@app.route('/export/report/pdf')
+@login_required
+def export_report_pdf():
+    rows, start_raw, end_raw = _filtered_rows_for_report(request.args)
+    data_raw = [['ID','Data','Map','Type','Device','Splices','Total ($)']]
+    total_usd = 0.0; total_splices = 0; total_rows = 0
+    for r in rows:
+        total_rows += 1; total_splices += int(r.splices or 0); total_usd += float(r.total_usd or 0)
+        data_raw.append([r.id, (r.created_date.date().isoformat() if r.created_date else ''), r.map, r.type, r.device, r.splices, f"$ {float(r.total_usd or 0):.2f}"])
+
+    from collections import defaultdict
+    by_map = defaultdict(lambda: {'rows':0,'splices':0,'total':0.0})
+    by_type = defaultdict(lambda: {'rows':0,'splices':0,'total':0.0})
+    for r in rows:
+        m = r.map or '—'; t = r.type or '—'
+        by_map[m]['rows'] += 1; by_map[m]['splices'] += int(r.splices or 0); by_map[m]['total'] += float(r.total_usd or 0)
+        by_type[t]['rows'] += 1; by_type[t]['splices'] += int(r.splices or 0); by_type[t]['total'] += float(r.total_usd or 0)
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, title="Relatório Twelve Tech")
+    styles = getSampleStyleSheet()
+    story = []
+
+    periodo = f"Período: {start_raw or 'início'} até {end_raw or 'fim'}"
+    story.append(Paragraph("<b>Relatório Twelve Tech</b>", styles['Title']))
+    story.append(Paragraph(periodo, styles['Normal']))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(f"Linhas: <b>{total_rows}</b> &nbsp;&nbsp; Fusões: <b>{total_splices}</b> &nbsp;&nbsp; Total: <b>$ {total_usd:.2f}</b>", styles['Normal']))
+    story.append(Spacer(1, 12))
+
+    def make_table(title, header, rows_dict):
+        story.append(Paragraph(f"<b>{title}</b>", styles['Heading3']))
+        data = [header] + [[k, v['rows'], v['splices'], f"$ {v['total']:.2f}"] for k,v in sorted(rows_dict.items())]
+        tbl = Table(data, hAlign='LEFT')
+        tbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#0e1726')),
+                                 ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+                                 ('GRID',(0,0),(-1,-1),0.25,colors.HexColor('#334155')),
+                                 ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.HexColor('#0b1220'), colors.HexColor('#111827')]),
+                                 ('TEXTCOLOR',(0,1),(-1,-1),colors.HexColor('#e5e7eb'))]))
+        story.append(tbl); story.append(Spacer(1, 10))
+
+    make_table('Por MAP', ['Map','Linhas','Fusões','Total ($)'], by_map)
+    make_table('Por TYPE', ['Type','Linhas','Fusões','Total ($)'], by_type)
+
+    story.append(Paragraph('<b>Registros (amostra, até 40)</b>', styles['Heading3']))
+    sample = data_raw[:41]  # header + 40 rows
+    tbl2 = Table(sample, hAlign='LEFT')
+    tbl2.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#0e1726')),
+                              ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+                              ('GRID',(0,0),(-1,-1),0.25,colors.HexColor('#334155')),
+                              ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.HexColor('#0b1220'), colors.HexColor('#111827')]),
+                              ('TEXTCOLOR',(0,1),(-1,-1),colors.HexColor('#e5e7eb'))]))
+    story.append(tbl2)
+
+    doc.build(story)
+    buf.seek(0)
+    name = f"relatorio_{start_raw or 'inicio'}_{end_raw or 'fim'}.pdf"
+    return send_file(buf, as_attachment=True, download_name=name, mimetype='application/pdf')
 
 if __name__=='__main__':
     app.run(host='0.0.0.0', port=8000, debug=True)
